@@ -1,0 +1,129 @@
+# Stage 0: the whole platform on one machine. From the repo root:  make up
+# All secrets here are local-development values; never reuse them anywhere real.
+name: apimarket
+
+x-go-env: &go-env
+  DATABASE_URL: postgres://apimarket:apimarket@postgres:5432/apimarket?sslmode=disable
+  REDIS_ADDR: redis:6379
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
+services:
+  # ---------- data stores ----------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: apimarket
+      POSTGRES_PASSWORD: apimarket
+      POSTGRES_DB: apimarket
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../migrations/postgres/0001_init.sql:/docker-entrypoint-initdb.d/0001_init.sql:ro
+      - ../deploy/seed/seed.sql:/docker-entrypoint-initdb.d/9999_seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U apimarket"]
+      interval: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 20
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: dev
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports: ["8123:8123"]
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - chdata:/var/lib/clickhouse
+      - ../migrations/clickhouse/0001_init.sql:/docker-entrypoint-initdb.d/0001_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping || exit 1"]
+      interval: 3s
+      retries: 30
+
+  # S3-compatible storage (specs, invoice PDFs) and a local mail catcher.
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: apimarket
+      MINIO_ROOT_PASSWORD: apimarket-dev
+    ports: ["9002:9000", "9001:9001"]
+    volumes: [miniodata:/data]
+    profiles: [extras]
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports: ["8025:8025", "1025:1025"]
+    profiles: [extras]
+
+  # ---------- fake providers ----------
+  mockprovider: # the "real" provider; requires the injected upstream credential
+    build: { context: .., args: { SERVICE: mockprovider } }
+    environment:
+      MOCK_PROVIDER_KEY: dev-provider-secret
+    ports: ["9000:9000"]
+
+  apimock: # mock server used by sandbox (mk_test_) keys; no credential needed
+    build: { context: .., args: { SERVICE: mockprovider } }
+
+  # ---------- platform ----------
+  gateway:
+    build: { context: .., args: { SERVICE: gateway } }
+    environment:
+      <<: *go-env
+      MASTER_KEY: ${MASTER_KEY:-ZKQRA+uAzZ+IT4rvPLNxPCM4g5X3CAfQUuRCFGMimSs=}
+      SPOOL_PATH: /spool/usage-spool.jsonl
+    ports: ["8080:8080"]
+    volumes: [spool:/spool]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      controlplane: { condition: service_started }
+
+  controlplane:
+    build: { context: .., args: { SERVICE: controlplane } }
+    environment:
+      <<: *go-env
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+    ports: ["8081:8081"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  metering:
+    build: { context: .., args: { SERVICE: metering } }
+    environment:
+      <<: *go-env
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: dev
+    depends_on:
+      redis: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+
+  # ---------- observability (optional: make up-obs) ----------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes: [./otel-collector.yaml:/etc/otelcol/config.yaml:ro]
+    ports: ["4317:4317", "4318:4318"]
+    profiles: [observability]
+
+volumes:
+  pgdata:
+  redisdata:
+  chdata:
+  miniodata:
+  spool:

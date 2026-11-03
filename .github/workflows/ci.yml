@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 3s --health-retries 20
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: apimarket
+          POSTGRES_PASSWORD: apimarket
+          POSTGRES_DB: apimarket
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U apimarket" --health-interval 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: go.mod / go.sum are tidy (checked against the Go checksum database)
+        run: |
+          if [ -s go.sum ]; then
+            go mod tidy -diff
+          else
+            echo "::warning::go.sum is not committed yet; run 'make tidy' and commit go.sum"
+            go mod tidy
+          fi
+          go mod verify
+
+      - name: Format and vet
+        run: |
+          test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+          go vet ./...
+
+      - name: Migrations and seed apply cleanly
+        env:
+          PGPASSWORD: apimarket
+        run: |
+          psql -h localhost -U apimarket -d apimarket -v ON_ERROR_STOP=1 -q -f migrations/postgres/0001_init.sql
+          psql -h localhost -U apimarket -d apimarket -v ON_ERROR_STOP=1 -q -f deploy/seed/seed.sql
+
+      - name: Tests (race detector; limiter tests use the real Redis service)
+        env:
+          REDIS_ADDR: localhost:6379
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -n 1
+
+  images:
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      matrix:
+        service: [gateway, controlplane, metering, mockprovider]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ${{ matrix.service }} image
+        run: docker build --build-arg SERVICE=${{ matrix.service }} -t apimarket/${{ matrix.service }}:ci .
