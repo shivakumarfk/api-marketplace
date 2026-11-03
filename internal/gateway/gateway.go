@@ -1,14 +1,8 @@
-// Package gateway is the data-plane hot path: authenticate the platform key,
-// route to the provider, enforce limits, inject the upstream credential,
-// forward with retries and a circuit breaker, and emit a usage event.
 package gateway
 
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -21,54 +15,62 @@ import (
 	"strings"
 	"time"
 
-	"apimarket/internal/apikey"
-	"apimarket/internal/billing"
-	"apimarket/internal/breaker"
-	"apimarket/internal/catalog"
-	"apimarket/internal/events"
-	"apimarket/internal/limiter"
+	"github.com/gin-gonic/gin"
+
+	"apimarket/internal/domain"
+	"apimarket/internal/domain/apikey"
+	"apimarket/internal/domain/billing"
+	"apimarket/internal/domain/catalog"
+	"apimarket/internal/domain/limits"
+	"apimarket/internal/domain/usage"
+	"apimarket/internal/platform/breaker"
+	mw "apimarket/internal/transport/http/middleware"
 )
-
-type SnapshotSource interface{ Current() *catalog.Snapshot }
-
-type Limiter interface {
-	Check(ctx context.Context, r limiter.Request) (limiter.Outcome, error)
-	Refund(ctx context.Context, r limiter.Request) error
-}
 
 type Config struct {
 	AttemptTimeout time.Duration // per upstream attempt
 	MaxRetries     int           // extra attempts for retryable failures
 	MaxBodyBytes   int64         // request bodies are buffered up to this size
 	TrustProxy     bool          // take the client IP from X-Forwarded-For
+	EventQueue     int           // buffered usage events awaiting publish
 }
 
 func DefaultConfig() Config {
-	return Config{AttemptTimeout: 10 * time.Second, MaxRetries: 2, MaxBodyBytes: 10 << 20}
+	return Config{AttemptTimeout: 10 * time.Second, MaxRetries: 2, MaxBodyBytes: 10 << 20, EventQueue: 10_000}
+}
+
+// Deps are the gateway's collaborators, all behind interfaces.
+type Deps struct {
+	Catalog  CatalogView
+	Limiter  Limiter
+	Usage    UsagePublisher
+	Breakers Breakers
+	Log      *slog.Logger
+	Client   *http.Client // optional; a tuned default is used if nil
 }
 
 type Gateway struct {
-	cfg      Config
-	snap     SnapshotSource
-	lim      Limiter
-	pub      events.Publisher
-	breakers *breaker.Set
-	client   *http.Client
-	log      *slog.Logger
-	now      func() time.Time
-	eventsCh chan events.Usage
+	cfg    Config
+	d      Deps
+	now    func() time.Time
+	events chan usage.Event
 }
 
-func New(cfg Config, snap SnapshotSource, lim Limiter, pub events.Publisher, breakers *breaker.Set, log *slog.Logger) *Gateway {
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.MaxIdleConnsPerHost = 256
-	g := &Gateway{
-		cfg: cfg, snap: snap, lim: lim, pub: pub, breakers: breakers, log: log, now: time.Now,
-		client:   &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
-		eventsCh: make(chan events.Usage, 10_000),
+func New(cfg Config, d Deps) *Gateway {
+	if d.Client == nil {
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.MaxIdleConnsPerHost = 256
+		d.Client = &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	}
-	return g
+	return &Gateway{cfg: cfg, d: d, now: time.Now, events: make(chan usage.Event, cfg.EventQueue)}
 }
+
+// BreakersFrom adapts the platform breaker set to the Breakers port.
+func BreakersFrom(s *breaker.Set) Breakers { return breakerSet{s} }
+
+type breakerSet struct{ s *breaker.Set }
+
+func (b breakerSet) For(apiID string) Breaker { return b.s.For(apiID) }
 
 // RunPublisher drains usage events to the bus off the hot path.
 func (g *Gateway) RunPublisher(ctx context.Context, workers int) {
@@ -78,139 +80,138 @@ func (g *Gateway) RunPublisher(ctx context.Context, workers int) {
 				select {
 				case <-ctx.Done():
 					return
-				case u := <-g.eventsCh:
-					if err := g.pub.Publish(context.WithoutCancel(ctx), u); err != nil {
-						g.log.Error("usage event lost", "err", err, "request_id", u.RequestID)
-					}
+				case e := <-g.events:
+					g.publish(context.WithoutCancel(ctx), e)
 				}
 			}
 		}()
 	}
 }
 
-// Handler returns the gateway HTTP handler. Routes: /{api-slug}/{path...}.
-func (g *Gateway) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
-	mux.HandleFunc("/{slug}/{rest...}", g.serve)
-	return mux
+func (g *Gateway) publish(ctx context.Context, e usage.Event) {
+	if err := g.d.Usage.Publish(ctx, e); err != nil {
+		g.d.Log.Error("usage event lost", "err", err, "request_id", e.RequestID)
+	}
 }
 
-// apiError is the stable error shape returned by the gateway.
-func writeError(w http.ResponseWriter, status int, code, msg, reqID string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": code, "message": msg, "request_id": reqID}})
+// Router builds the Gin engine. Everything except /healthz is proxied:
+// /{api-slug}/{path...}.
+func (g *Gateway) Router() *gin.Engine {
+	r := gin.New()
+	r.Use(mw.Recovery(g.d.Log), mw.RequestID())
+	r.GET("/healthz", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+	r.NoRoute(g.proxy)
+	r.NoMethod(g.proxy)
+	r.HandleMethodNotAllowed = false
+	return r
 }
 
-func newRequestID() string {
-	b := make([]byte, 12)
-	rand.Read(b)
-	return "req_" + hex.EncodeToString(b)
+func splitPath(p string) (slug, rest string) {
+	p = strings.TrimPrefix(p, "/")
+	slug, rest, _ = strings.Cut(p, "/")
+	return slug, rest
 }
 
-func (g *Gateway) serve(w http.ResponseWriter, r *http.Request) {
+func (g *Gateway) proxy(c *gin.Context) {
 	start := g.now()
-	reqID := newRequestID()
-	w.Header().Set("X-Request-Id", reqID)
-	snap := g.snap.Current()
+	reqID := mw.GetRequestID(c)
+	snap := g.d.Catalog.Current()
+	r := c.Request
 
 	// 1. Authenticate.
 	plain := apikey.FromRequestHeaders(r.Header.Get("X-API-Key"), r.Header.Get("Authorization"))
 	if plain == "" {
-		writeError(w, http.StatusUnauthorized, "MISSING_KEY", "provide your platform key in the X-API-Key header", reqID)
+		mw.AbortWithError(c, http.StatusUnauthorized, "MISSING_KEY", "provide your platform key in the X-API-Key header")
 		return
 	}
 	key, ok := snap.KeysByHash[apikey.Hash(plain)]
 	if !ok || !key.Usable(start) {
-		writeError(w, http.StatusUnauthorized, "INVALID_KEY", "the key is invalid, revoked or expired", reqID)
+		mw.AbortWithError(c, http.StatusUnauthorized, "INVALID_KEY", "the key is invalid, revoked or expired")
 		return
 	}
 	clientIP := g.clientIP(r)
 	if !key.AllowsIP(clientIP) {
-		writeError(w, http.StatusForbidden, "IP_NOT_ALLOWED", "this key is not allowed from your IP address", reqID)
+		mw.AbortWithError(c, http.StatusForbidden, "IP_NOT_ALLOWED", "this key is not allowed from your IP address")
 		return
 	}
 	org, ok := snap.Orgs[key.OrgID]
-	if !ok || org.Status != "active" {
-		writeError(w, http.StatusForbidden, "ORG_INACTIVE", "the account is not active", reqID)
+	if !ok || !org.Active() {
+		mw.AbortWithError(c, http.StatusForbidden, "ORG_INACTIVE", "the account is not active")
 		return
 	}
 
 	// 2. Route and check the subscription.
-	api, ok := snap.APIsBySlug[r.PathValue("slug")]
+	slug, rest := splitPath(r.URL.Path)
+	api, ok := snap.APIsBySlug[slug]
 	if !ok {
-		writeError(w, http.StatusNotFound, "API_NOT_FOUND", "no published API with this name", reqID)
+		mw.AbortWithError(c, http.StatusNotFound, "API_NOT_FOUND", "no published API with this name")
 		return
 	}
 	sub, ok := snap.Subs[catalog.SubKey(org.ID, api.ID)]
-	if !ok {
-		writeError(w, http.StatusForbidden, "NOT_SUBSCRIBED", "your account is not subscribed to this API", reqID)
-		return
-	}
-	plan, ok := snap.Plans[sub.PlanID]
-	if !ok {
-		writeError(w, http.StatusForbidden, "NOT_SUBSCRIBED", "the subscription's plan is not available", reqID)
+	plan, planOK := snap.Plans[sub.PlanID]
+	if !ok || !planOK {
+		mw.AbortWithError(c, http.StatusForbidden, "NOT_SUBSCRIBED", "your account is not subscribed to this API")
 		return
 	}
 
-	sandbox := key.Env == string(apikey.EnvSandbox)
+	sandbox := key.Env == domain.EnvSandbox
 	target, secret := api.BaseURL, api.Secret
 	if sandbox {
 		// Sandbox keys hit the mock server: free, no quota, still rate limited.
 		target, secret = api.MockURL, ""
 		if target == "" {
-			writeError(w, http.StatusNotFound, "NO_MOCK", "this API has no mock server for sandbox keys", reqID)
+			mw.AbortWithError(c, http.StatusNotFound, "NO_MOCK", "this API has no mock server for sandbox keys")
 			return
 		}
 	}
 
 	// 3. Circuit breaker before reserving anything.
-	cb := g.breakers.For(api.ID)
+	cb := g.d.Breakers.For(api.ID)
 	if !sandbox && !cb.Allow() {
-		writeError(w, http.StatusServiceUnavailable, "PROVIDER_UNAVAILABLE", "the provider is currently unavailable; you are not charged", reqID)
+		mw.AbortWithError(c, http.StatusServiceUnavailable, "PROVIDER_UNAVAILABLE", "the provider is currently unavailable; you are not charged")
 		return
 	}
+	release := func() {
+		if !sandbox {
+			cb.Release()
+		}
+	}
 
-	// 4. Limits, quota, balance — one atomic Redis call.
-	lr := limiter.Request{
+	// 4. Limits, quota, balance — one atomic call.
+	lr := limits.Request{
 		KeyID: key.ID, APIID: api.ID, SubscriptionID: sub.ID, OrgID: org.ID,
 		PeriodStart: sub.PeriodStart, PeriodEnd: sub.PeriodEnd, RateRPS: plan.RateLimitRPS,
 	}
 	if !sandbox {
 		lr.QuotaLimit = plan.IncludedCalls
 		lr.UpstreamRPS = api.UpstreamRPS
-		lr.PriceMicro = plan.PricePerCallMicro
-		lr.Prepaid = org.BillingMode == "prepaid"
+		lr.PriceMicro = int64(plan.PricePerCall)
+		lr.Prepaid = org.BillingMode == domain.Prepaid
 	}
-	out, err := g.lim.Check(r.Context(), lr)
+	out, err := g.d.Limiter.Check(r.Context(), lr)
 	if err != nil {
-		g.log.Error("limiter unavailable", "err", err)
-		if !sandbox {
-			cb.Release() // not the provider's fault
-		}
-		writeError(w, http.StatusServiceUnavailable, "LIMITER_UNAVAILABLE", "temporarily unable to check limits; retry shortly", reqID)
+		g.d.Log.Error("limiter unavailable", "err", err)
+		release()
+		mw.AbortWithError(c, http.StatusServiceUnavailable, "LIMITER_UNAVAILABLE", "temporarily unable to check limits; retry shortly")
 		return
 	}
-	if out.Result != limiter.OK {
-		if !sandbox {
-			cb.Release()
-		}
-		g.reject(w, out, reqID)
+	if out.Result != limits.OK {
+		release()
+		g.reject(c, out)
 		return
 	}
 	if out.QuotaRemaining >= 0 {
-		w.Header().Set("X-Quota-Remaining", strconv.FormatInt(out.QuotaRemaining, 10))
+		c.Header("X-Quota-Remaining", strconv.FormatInt(out.QuotaRemaining, 10))
 	}
 
 	// 5. Forward.
-	res := g.forward(r, target, r.PathValue("rest"), api, secret)
+	res := g.forward(r, target, rest, api, secret)
 	if res.tooLarge {
+		release()
 		if !sandbox {
-			cb.Release()
-			g.lim.Refund(context.WithoutCancel(r.Context()), lr)
+			g.refund(r.Context(), lr, reqID)
 		}
-		writeError(w, http.StatusRequestEntityTooLarge, "BODY_TOO_LARGE", "request body exceeds the gateway limit", reqID)
+		mw.AbortWithError(c, http.StatusRequestEntityTooLarge, "BODY_TOO_LARGE", "request body exceeds the gateway limit")
 		return
 	}
 	if !sandbox {
@@ -218,56 +219,59 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	billable := !sandbox && billing.Billable(res.status, res.failed)
 	if !sandbox && !billable {
-		if err := g.lim.Refund(context.WithoutCancel(r.Context()), lr); err != nil {
-			g.log.Error("refund failed; reconciliation will correct it", "err", err, "request_id", reqID)
-		}
+		g.refund(r.Context(), lr, reqID)
 	}
 
+	// 6. Respond.
 	var respBytes int64
 	errCode := ""
 	if res.failed {
 		errCode = "UPSTREAM_UNREACHABLE"
-		writeError(w, http.StatusBadGateway, errCode, "the provider did not respond; you are not charged", reqID)
+		mw.AbortWithError(c, http.StatusBadGateway, errCode, "the provider did not respond; you are not charged")
 	} else {
-		respBytes = g.copyResponse(w, res.resp)
+		respBytes = g.copyResponse(c.Writer, res.resp)
 	}
 
-	cost, provCost := int64(0), int64(0)
+	// 7. Meter.
+	var cost, provCost int64
 	if billable {
-		cost, provCost = plan.PricePerCallMicro, plan.ProviderCostMicro
+		cost, provCost = int64(plan.PricePerCall), int64(plan.ProviderCostPerCall)
 	}
-	u := events.Usage{
-		TS: start.UTC(), RequestID: reqID, OrgID: org.ID, KeyID: key.ID, Env: key.Env,
-		APIID: api.ID, SubscriptionID: sub.ID, Method: r.Method, Path: "/" + r.PathValue("rest"),
+	e := usage.Event{
+		TS: start.UTC(), RequestID: reqID, OrgID: org.ID, KeyID: key.ID, Env: string(key.Env),
+		APIID: api.ID, SubscriptionID: sub.ID, Method: r.Method, Path: "/" + rest,
 		Status: res.status, LatencyMS: g.now().Sub(start).Milliseconds(), UpstreamMS: res.upstream.Milliseconds(),
 		ReqBytes: res.reqBytes, RespBytes: respBytes, Billable: billable, CostMicro: cost, ProviderMicro: provCost,
 		ErrorCode: errCode, ClientIP: clientIP.String(), RetryCount: res.retries,
 	}
 	select {
-	case g.eventsCh <- u:
-	default:
-		// Queue full: publish inline rather than drop (the Spool handles bus outages).
-		if err := g.pub.Publish(context.WithoutCancel(r.Context()), u); err != nil {
-			g.log.Error("usage event lost", "err", err, "request_id", reqID)
-		}
+	case g.events <- e:
+	default: // queue full: publish inline rather than drop
+		g.publish(context.WithoutCancel(r.Context()), e)
 	}
 }
 
-func (g *Gateway) reject(w http.ResponseWriter, out limiter.Outcome, reqID string) {
+func (g *Gateway) refund(ctx context.Context, lr limits.Request, reqID string) {
+	if err := g.d.Limiter.Refund(context.WithoutCancel(ctx), lr); err != nil {
+		g.d.Log.Error("refund failed; reconciliation will correct it", "err", err, "request_id", reqID)
+	}
+}
+
+func (g *Gateway) reject(c *gin.Context, out limits.Outcome) {
 	switch out.Result {
-	case limiter.RateLimited:
-		w.Header().Set("Retry-After", "1")
-		writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "plan rate limit reached; slow down", reqID)
-	case limiter.QuotaExceeded:
-		w.Header().Set("X-Quota-Remaining", "0")
-		writeError(w, http.StatusTooManyRequests, "QUOTA_EXCEEDED", "monthly quota used up; upgrade your plan or wait for the next period", reqID)
-	case limiter.UpstreamLimited:
-		w.Header().Set("Retry-After", "1")
-		writeError(w, http.StatusTooManyRequests, "UPSTREAM_LIMIT", "the provider's capacity is temporarily exhausted", reqID)
-	case limiter.InsufficientBalance:
-		writeError(w, http.StatusPaymentRequired, "INSUFFICIENT_BALANCE", "prepaid balance too low; top up to continue", reqID)
+	case limits.RateLimited:
+		c.Header("Retry-After", "1")
+		mw.AbortWithError(c, http.StatusTooManyRequests, "RATE_LIMITED", "plan rate limit reached; slow down")
+	case limits.QuotaExceeded:
+		c.Header("X-Quota-Remaining", "0")
+		mw.AbortWithError(c, http.StatusTooManyRequests, "QUOTA_EXCEEDED", "monthly quota used up; upgrade your plan or wait for the next period")
+	case limits.UpstreamLimited:
+		c.Header("Retry-After", "1")
+		mw.AbortWithError(c, http.StatusTooManyRequests, "UPSTREAM_LIMIT", "the provider's capacity is temporarily exhausted")
+	case limits.InsufficientBalance:
+		mw.AbortWithError(c, http.StatusPaymentRequired, "INSUFFICIENT_BALANCE", "prepaid balance too low; top up to continue")
 	default:
-		writeError(w, http.StatusServiceUnavailable, "BALANCE_UNAVAILABLE", "temporarily unable to read your balance; retry shortly", reqID)
+		mw.AbortWithError(c, http.StatusServiceUnavailable, "BALANCE_UNAVAILABLE", "temporarily unable to read your balance; retry shortly")
 	}
 }
 
@@ -275,10 +279,10 @@ type fwdResult struct {
 	resp     *http.Response
 	status   int
 	failed   bool
+	tooLarge bool
 	retries  int
 	upstream time.Duration
 	reqBytes int64
-	tooLarge bool
 }
 
 var hopByHop = map[string]bool{
@@ -304,26 +308,25 @@ func (g *Gateway) forward(r *http.Request, base, rest string, api catalog.API, s
 	}
 	hasIdem := r.Header.Get("Idempotency-Key") != ""
 
-	var res fwdResult
-	res.reqBytes = int64(len(body))
+	res := fwdResult{reqBytes: int64(len(body))}
 	t0 := g.now()
 	for attempt := 0; ; attempt++ {
 		ctx, cancel := context.WithTimeout(r.Context(), g.cfg.AttemptTimeout)
 		out, err := http.NewRequestWithContext(ctx, r.Method, url, bytes.NewReader(body))
 		if err != nil {
 			cancel()
-			return fwdResult{failed: true}
+			res.failed = true
+			return res
 		}
 		for k, vs := range r.Header {
-			if hopByHop[k] || stripInbound[k] {
-				continue
+			if !hopByHop[k] && !stripInbound[k] {
+				out.Header[k] = vs
 			}
-			out.Header[k] = vs
 		}
 		if secret != "" && api.AuthHeader != "" {
 			out.Header.Set(api.AuthHeader, secret)
 		}
-		resp, err := g.client.Do(out)
+		resp, err := g.d.Client.Do(out)
 		failed := err != nil
 		status := 0
 		if !failed {
@@ -359,18 +362,17 @@ type cancelOnClose struct {
 
 func (c *cancelOnClose) Close() error { err := c.ReadCloser.Close(); c.cancel(); return err }
 
-func (g *Gateway) copyResponse(w http.ResponseWriter, resp *http.Response) int64 {
+func (g *Gateway) copyResponse(w gin.ResponseWriter, resp *http.Response) int64 {
 	defer resp.Body.Close()
 	for k, vs := range resp.Header {
-		if hopByHop[k] || k == "Set-Cookie" {
-			continue
+		if !hopByHop[k] && k != "Set-Cookie" {
+			w.Header()[k] = vs
 		}
-		w.Header()[k] = vs
 	}
 	w.WriteHeader(resp.StatusCode)
 	n, err := io.Copy(w, resp.Body)
 	if err != nil && !errors.Is(err, context.Canceled) {
-		g.log.Warn("response copy interrupted", "err", err)
+		g.d.Log.Warn("response copy interrupted", "err", err)
 	}
 	return n
 }
@@ -378,8 +380,7 @@ func (g *Gateway) copyResponse(w http.ResponseWriter, resp *http.Response) int64
 func (g *Gateway) clientIP(r *http.Request) netip.Addr {
 	if g.cfg.TrustProxy {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			first := strings.TrimSpace(strings.Split(xff, ",")[0])
-			if ip, err := netip.ParseAddr(first); err == nil {
+			if ip, err := netip.ParseAddr(strings.TrimSpace(strings.Split(xff, ",")[0])); err == nil {
 				return ip.Unmap()
 			}
 		}

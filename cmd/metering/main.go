@@ -2,47 +2,45 @@
 package main
 
 import (
-	"context"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
-	"apimarket/internal/config"
-	"apimarket/internal/events"
+	"apimarket/internal/adapter/clickhouse"
+	redisx "apimarket/internal/adapter/redis"
 	"apimarket/internal/metering"
+	"apimarket/internal/platform/config"
+	"apimarket/internal/platform/run"
 )
 
 func main() {
-	log := config.Logger("metering")
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	cfg, err := config.LoadMetering()
+	log := config.Logger("metering", cfg.LogLevel)
+	if err != nil {
+		run.Fatal(log, "config", err)
+	}
+	ctx, stop := run.Context()
 	defer stop()
 
-	rdb := redis.NewClient(&redis.Options{Addr: config.String("REDIS_ADDR", "localhost:6379")})
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
 	defer rdb.Close()
 
 	host, _ := os.Hostname()
-	var in *events.RedisStream
-	var err error
-	for i := 0; ; i++ {
-		in, err = events.NewRedisStream(rdb, config.String("USAGE_STREAM", "usage")).AsConsumer(ctx, "metering", host)
-		if err == nil {
-			break
-		}
-		if i == 30 || ctx.Err() != nil {
-			log.Error("cannot join consumer group", "err", err)
-			os.Exit(1)
-		}
-		time.Sleep(2 * time.Second)
+	var in *redisx.UsageStream
+	err = run.Retry(ctx, log, "redis", 30, func() (err error) {
+		in, err = redisx.NewUsageStream(rdb, cfg.UsageStream).Join(ctx, "metering", host)
+		return err
+	})
+	if err != nil {
+		run.Fatal(log, "join consumer group", err)
 	}
 
 	w := &metering.Worker{
 		In:    in,
-		Out:   metering.NewClickHouse(config.String("CLICKHOUSE_URL", "http://localhost:8123"), config.String("CLICKHOUSE_USER", "default"), config.String("CLICKHOUSE_PASSWORD", "")),
+		Out:   clickhouse.NewCallLogWriter(cfg.ClickHouseURL, cfg.ClickHouseUser, cfg.ClickHousePassword),
 		Log:   log,
-		Batch: config.Int("BATCH_SIZE", 500),
+		Batch: cfg.BatchSize,
 		Block: 2 * time.Second,
 	}
 	log.Info("metering worker started", "consumer", host)

@@ -1,63 +1,72 @@
 // Command controlplane serves the catalog and the Stage 0 admin API.
+// main only builds adapters and injects them into services and handlers.
 package main
 
 import (
-	"context"
-	"errors"
-	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
-	"time"
-
+	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
-	"apimarket/internal/config"
-	"apimarket/internal/controlplane"
+	"apimarket/internal/adapter/postgres"
+	redisx "apimarket/internal/adapter/redis"
+	"apimarket/internal/domain/apikey"
+	"apimarket/internal/platform/config"
+	"apimarket/internal/platform/run"
+	"apimarket/internal/service"
+	"apimarket/internal/transport/http/controlplane"
 )
 
 func main() {
-	log := config.Logger("controlplane")
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	cfg, err := config.LoadControlPlane()
+	log := config.Logger("controlplane", cfg.LogLevel)
+	if err != nil {
+		run.Fatal(log, "config", err)
+	}
+	gin.SetMode(gin.ReleaseMode)
+	ctx, stop := run.Context()
 	defer stop()
 
-	db, err := pgxpool.New(ctx, config.Must("DATABASE_URL"))
+	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
-		log.Error("database config", "err", err)
-		os.Exit(1)
+		run.Fatal(log, "database config", err)
 	}
-	defer db.Close()
-	rdb := redis.NewClient(&redis.Options{Addr: config.String("REDIS_ADDR", "localhost:6379")})
+	defer pool.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
 	defer rdb.Close()
 
-	s := &controlplane.Server{DB: db, Redis: rdb, AdminToken: config.Must("ADMIN_TOKEN"), Log: log}
+	// Adapters
+	db := postgres.DB{Pool: pool}
+	tx := postgres.TxManager{DB: db}
+	orgs, keys, cat := postgres.OrgRepo{DB: db}, postgres.KeyRepo{DB: db}, postgres.CatalogRepo{DB: db}
+	subs, ledger, audit := postgres.SubscriptionRepo{DB: db}, postgres.LedgerRepo{DB: db}, postgres.AuditRepo{DB: db}
+	balances := redisx.NewBalanceStore(rdb)
+	clock := service.SystemClock{}
 
-	// Rebuild prepaid balances in Redis from the ledger (Redis is never the source of truth).
-	for i := 0; ; i++ {
-		n, err := s.RebuildBalances(ctx)
-		if err == nil {
-			log.Info("prepaid balances checked", "restored", n)
-			break
-		}
-		if i == 30 || ctx.Err() != nil {
-			log.Error("balance rebuild failed", "err", err)
-			os.Exit(1)
-		}
-		log.Warn("waiting for database/redis", "err", err)
-		time.Sleep(2 * time.Second)
+	// Services
+	billing := &service.BillingService{Tx: tx, Orgs: orgs, Ledger: ledger, Audit: audit, Balances: balances, Log: log}
+	deps := controlplane.Deps{
+		Orgs:       &service.OrgService{Tx: tx, Orgs: orgs, Audit: audit, Balances: balances, Log: log},
+		Keys:       &service.KeyService{Tx: tx, Orgs: orgs, Keys: keys, Audit: audit, Gen: apikey.RandomGenerator{}, Clock: clock},
+		Subs:       &service.SubscriptionService{Tx: tx, Orgs: orgs, Catalog: cat, Subs: subs, Audit: audit, Clock: clock},
+		Wallets:    billing,
+		Catalog:    &service.CatalogService{Catalog: cat},
+		AdminToken: cfg.AdminToken,
+		Log:        log,
 	}
 
-	srv := &http.Server{Addr: config.String("ADDR", ":8081"), Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second}
-	go func() {
-		<-ctx.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		srv.Shutdown(shutdown)
-	}()
-	log.Info("control plane listening", "addr", srv.Addr)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Error("server", "err", err)
-		os.Exit(1)
+	// Redis is never the source of truth: restore missing prepaid balances from the ledger.
+	err = run.Retry(ctx, log, "database/redis", 30, func() error {
+		n, err := billing.RebuildBalances(ctx)
+		if err == nil {
+			log.Info("prepaid balances checked", "restored", n)
+		}
+		return err
+	})
+	if err != nil {
+		run.Fatal(log, "balance rebuild", err)
+	}
+
+	if err := run.Serve(ctx, log, cfg.Addr, controlplane.Router(deps)); err != nil {
+		run.Fatal(log, "server", err)
 	}
 }

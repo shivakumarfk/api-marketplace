@@ -31,8 +31,10 @@ ps: ## Show running containers
 demo: ## Run example calls through the gateway
 	./scripts/demo.sh
 
-test: ## Unit + integration tests (integration tests need Redis on localhost:6379, else they skip)
-	go test -race -count=1 ./...
+TEST_DATABASE_URL ?= postgres://apimarket:apimarket@localhost:5432/apimarket?sslmode=disable
+
+test: ## Unit + integration tests (uses Postgres/Redis from `make up`; integration tests skip if absent)
+	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" REDIS_ADDR=localhost:6379 go test -race -count=1 ./...
 
 test-unit: ## Unit tests only
 	go test -count=1 -short ./...

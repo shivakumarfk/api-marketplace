@@ -1,4 +1,4 @@
-# API Marketplace — MVP Architecture & Data Model (v0.4)
+# API Marketplace — MVP Architecture & Data Model (v0.5)
 
 _Companion to `mvp-requirements.md`. Phase 1 = REST only, India only, INR, card only. Webhooks and gRPC are Phase 2. Costs are in `aws-cost-estimate.md`; a cheaper staged path (local Mac → lean servers → full HA) is in §11._
 
@@ -48,9 +48,9 @@ flowchart LR
 
 | Component | Responsibility | Suggested tech |
 |---|---|---|
-| **Gateway** | Key auth, routing, subscription check, rate limit/quota/balance, credential injection, retries, circuit breaking, metering events | Custom Go service on `httputil.ReverseProxy` (REST-only in Phase 1, billing logic is custom anyway, no extra hops). Alternative: Kong/APISIX with plugins. |
+| **Gateway** | Key auth, routing, subscription check, rate limit/quota/balance, credential injection, retries, circuit breaking, metering events | Custom Go service on **Gin** (REST-only in Phase 1, billing logic is custom anyway, no extra hops). Alternative: Kong/APISIX with plugins. |
 | **Web app** | Public catalog (SSR/SEO), customer console, internal admin console | Next.js |
-| **Control-plane API** | Identity, orgs, keys, catalog, onboarding workflow, plans, subscriptions, alerts config | Go (or Node) modular monolith in Phase 1, split later |
+| **Control-plane API** | Identity, orgs, keys, catalog, onboarding workflow, plans, subscriptions, alerts config | Go on **Gin**, modular monolith in Phase 1 (layered: transport → service → ports → adapters), split later |
 | **Onboarding pipeline** | Spec ingestion (OpenAPI 2/3), draft listing, mock server, snippet generation (Go/Node/Java) | openapi parser, Prism-style mock, templated snippets |
 | **Metering consumer** | Event bus → ClickHouse logs + per-minute rollups; → ledger | Go consumer |
 | **Billing / ledger** | Prepaid wallet, postpaid invoicing, GST invoices, provider statements, PSP integration | Go service, double-entry ledger in PostgreSQL |
@@ -58,6 +58,14 @@ flowchart LR
 | **Notifications** | Email + in-app (SSE/WebSocket) only in Phase 1 | Transactional email provider + Postgres `notifications` |
 | **Audit** | Append-only audit events from all services | Event bus → ClickHouse (60-day TTL) |
 | _Webhook relay (Phase 2)_ | _Per-subscription inbound URLs, verify provider signature, meter, re-sign (HMAC), deliver with retries + DLQ; platform events by webhook_ | _Go service + a queue_ |
+
+**Code structure (decided 2026-11-04): Gin for HTTP, interfaces at every boundary.**
+- `internal/domain`: entities and business rules (orgs, keys, plans, ledger, money, GSTIN). No I/O, no framework.
+- `internal/service`: control-plane use cases. Each service depends only on small interfaces it declares (`OrgRepo`, `KeyRepo`, `LedgerRepo`, `BalanceStore`, `TxManager`, `Clock`, `KeyGenerator`…), so it is unit-tested with in-memory fakes.
+- `internal/adapter/{postgres,redis,clickhouse,secrets,spool}`: implementations of those interfaces; tested against real Postgres/Redis.
+- `internal/transport/http`: Gin routers and handlers. They decode, call a service through an interface, and encode; no SQL or business rules.
+- `internal/gateway`: the proxy, on Gin, depending only on its own ports (`CatalogView`, `Limiter`, `UsagePublisher`, `Breakers`).
+- `cmd/*`: wiring only. Constructor injection, no DI framework.
 
 **Modular monolith for the control plane:** with a small MVP team, one deployable with clear modules (identity, catalog, billing...) is much cheaper to run than ten microservices. The gateway and consumers are separate because they scale and fail differently.
 

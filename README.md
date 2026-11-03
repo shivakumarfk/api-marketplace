@@ -39,6 +39,8 @@ curl -H "X-API-Key: mk_live_DemoIndividualLive0000000000000000000000001" \
 ```
 
 ## What works today
+All HTTP is served with Gin. Every layer talks to the next through interfaces (see [Code structure](#code-structure)).
+
 - **Gateway:** key auth (hashed keys, expiry, revoke, IP allowlist), routing by API slug, subscription check, upstream credential injection (the customer's key never reaches the provider), sandbox keys routed to a mock server for free.
 - **Limits in one atomic Redis call:** plan rate limit, monthly quota (blocks when used up), the provider's shared upstream limit, and the prepaid balance reservation. If the balance is unknown, the call is refused rather than let through free.
 - **Billing rules:** 2xx–4xx billed; provider 5xx/timeouts not billed and refunded. Retries only for idempotent requests (never a plain POST). A per-provider circuit breaker.
@@ -67,29 +69,58 @@ All admin calls need `Authorization: Bearer dev-admin-token`.
 | POST | `/v1/admin/orgs/{org}/keys` | `{"env":"production\|sandbox","name"}`, returns the key once |
 | POST | `/v1/admin/keys/{key}/revoke` | |
 | POST | `/v1/admin/orgs/{org}/subscriptions` | `{"api_slug","plan_id"}` |
-| POST | `/v1/admin/orgs/{org}/topups` | `{"amount_rupees"}`, prepaid only |
+| POST | `/v1/admin/orgs/{org}/topups` | `{"amount_rupees","payment_ref"}`, prepaid only; the same `payment_ref` can't be credited twice |
 | GET | `/v1/admin/orgs/{org}/balance` | |
 
-## Layout
+## Code structure
+Go 1.24, **Gin** for HTTP, **pgx** for PostgreSQL, **go-redis** for Redis. Interfaces sit at every boundary, and dependencies point inward:
+
 ```
-cmd/          gateway, controlplane, metering worker, mockprovider
-internal/     apikey, billing rules, breaker, catalog, config, controlplane,
-              events (bus + spool), gateway, gstin, limiter (+ Lua), metering,
-              money (micro-rupees), secrets (credential encryption)
-migrations/   PostgreSQL and ClickHouse schema
-deploy/       docker-compose.yml, seed data, OpenTelemetry Collector config
-scripts/      demo.sh
-docs/         design docs
+cmd/                         wiring only: build adapters, inject them (no DI framework)
+  gateway/ controlplane/ metering/ mockprovider/
+internal/
+  domain/                    entities + business rules, no I/O
+    apikey/ billing/ gstin/ money/   key format, billable/retry rules, GSTIN check, micro-rupees
+    catalog/ limits/ usage/          gateway read model, limiter contract, usage event
+  service/                   control-plane use cases (orgs, keys, subscriptions, billing)
+    ports.go                 the interfaces services depend on: OrgRepo, KeyRepo, LedgerRepo,
+                             BalanceStore, TxManager, Clock, KeyGenerator, ...
+  adapter/                   implementations of those interfaces
+    postgres/                repositories, TxManager, gateway catalog snapshot
+    redis/                   atomic limiter (Lua), live balances, usage stream
+    clickhouse/ secrets/ spool/
+  gateway/                   the proxy (Gin); depends only on its own ports.go
+  metering/                  usage → call logs worker; ports: Consumer, CallLogWriter
+  transport/http/
+    controlplane/            Gin router + handlers (decode → service interface → encode)
+    middleware/              request id, recovery, access log, admin bearer auth, error shape
+  platform/                  config (typed, validated), breaker, run helpers
+migrations/  deploy/  scripts/  docs/
 ```
+
+How to add a feature:
+1. Put the rule in `domain`.
+2. Add the use case in `service`, declaring any new port it needs in `ports.go`.
+3. Implement the port in `adapter/...`, with a compile-time `var _ service.X = ...` check.
+4. Expose it in `transport/http`.
+5. Wire it in `cmd/`.
 
 ## Tests
 ```bash
-make test   # go test -race ./...   (limiter tests use a real Redis on localhost:6379, else they skip)
+make up     # Postgres + Redis for the integration tests
+make test   # go test -race ./...
 ```
-CI (GitHub Actions) runs these checks with real Redis and PostgreSQL:
+| Layer | How it's tested |
+|---|---|
+| domain | pure unit tests, including property tests for money rounding and ledger balance |
+| service | unit tests with in-memory fakes of every port, including rollback when the audit write fails |
+| adapter/postgres | integration tests against a real PostgreSQL. Each run gets a fresh schema with the real migration applied, and the DB-level guards are tested too. |
+| adapter/redis | integration tests against a real Redis, e.g. 200 concurrent calls on a nearly empty balance never overspend |
+| transport/http, gateway | Gin handler tests with fake services, a fake provider and a fake limiter |
+
+Integration tests skip when `TEST_DATABASE_URL` or Redis aren't available. CI (GitHub Actions) runs everything with real Postgres and Redis, plus these checks:
 - formatting and vet
 - that the migrations and seed apply cleanly
-- all tests with the race detector
 - a Docker image build for every service
 
 **One-time step:** `go.sum` isn't committed yet. The first scaffold was built somewhere that couldn't reach the Go checksum database. Run `make tidy` on your Mac, then commit `go.sum`. Docker builds and CI generate it automatically until then.

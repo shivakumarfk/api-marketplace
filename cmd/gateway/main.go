@@ -1,91 +1,73 @@
-// Command gateway is the data-plane proxy: GET/POST /{api-slug}/{path} with X-API-Key.
+// Command gateway is the data-plane proxy: /{api-slug}/{path} with X-API-Key.
+// main only wires adapters into the gateway's ports.
 package main
 
 import (
-	"context"
-	"errors"
-	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
-	"apimarket/internal/breaker"
-	"apimarket/internal/catalog"
-	"apimarket/internal/config"
-	"apimarket/internal/events"
+	"apimarket/internal/adapter/postgres"
+	redisx "apimarket/internal/adapter/redis"
+	"apimarket/internal/adapter/secrets"
+	"apimarket/internal/adapter/spool"
 	"apimarket/internal/gateway"
-	"apimarket/internal/limiter"
-	"apimarket/internal/secrets"
+	"apimarket/internal/platform/breaker"
+	"apimarket/internal/platform/config"
+	"apimarket/internal/platform/run"
 )
 
 func main() {
-	log := config.Logger("gateway")
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	cfg, err := config.LoadGateway()
+	log := config.Logger("gateway", cfg.LogLevel)
+	if err != nil {
+		run.Fatal(log, "config", err)
+	}
+	gin.SetMode(gin.ReleaseMode)
+	ctx, stop := run.Context()
 	defer stop()
 
-	db, err := pgxpool.New(ctx, config.Must("DATABASE_URL"))
+	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
-		log.Error("database config", "err", err)
-		os.Exit(1)
+		run.Fatal(log, "database config", err)
 	}
-	defer db.Close()
-	rdb := redis.NewClient(&redis.Options{Addr: config.String("REDIS_ADDR", "localhost:6379")})
+	defer pool.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
 	defer rdb.Close()
-
-	box, err := secrets.NewBox(config.Must("MASTER_KEY"))
+	box, err := secrets.NewLocalBox(cfg.MasterKey)
 	if err != nil {
-		log.Error("master key", "err", err)
-		os.Exit(1)
+		run.Fatal(log, "master key", err)
 	}
 
-	// Load the catalog before taking traffic; retry while dependencies start.
-	cat := catalog.NewLoader(db, box, log)
-	for i := 0; ; i++ {
-		if err = cat.Refresh(ctx); err == nil {
-			break
-		}
-		if i == 30 || ctx.Err() != nil {
-			log.Error("initial catalog load failed", "err", err)
-			os.Exit(1)
-		}
-		log.Warn("waiting for database", "err", err)
-		time.Sleep(2 * time.Second)
+	// Load the catalog before taking traffic.
+	cache := gateway.NewCatalogCache(postgres.SnapshotSource{DB: postgres.DB{Pool: pool}, Secrets: box, Log: log}, log)
+	if err := run.Retry(ctx, log, "catalog", 30, func() error { return cache.Refresh(ctx) }); err != nil {
+		run.Fatal(log, "initial catalog load", err)
 	}
-	go cat.Run(ctx, config.Duration("CATALOG_REFRESH", 5*time.Second))
+	go cache.Run(ctx, cfg.CatalogRefresh)
 
-	spool := events.NewSpool(events.NewRedisStream(rdb, config.String("USAGE_STREAM", "usage")),
-		config.String("SPOOL_PATH", "/tmp/usage-spool.jsonl"), log)
-	go spool.RunReplay(ctx, 10*time.Second)
+	usage := spool.New(redisx.NewUsageStream(rdb, cfg.UsageStream), cfg.SpoolPath, log)
+	go usage.RunReplay(ctx, 10*time.Second)
 
 	breakers := breaker.NewSet(5, 30*time.Second, func(apiID string, from, to breaker.State) {
 		// TODO: publish an API status change so the alert engine notifies subscribers.
 		log.Warn("provider circuit changed", "api_id", apiID, "from", from.String(), "to", to.String())
 	})
 
-	cfg := gateway.DefaultConfig()
-	cfg.AttemptTimeout = config.Duration("UPSTREAM_TIMEOUT", cfg.AttemptTimeout)
-	cfg.TrustProxy = config.Bool("TRUST_PROXY", false)
-	gw := gateway.New(cfg, cat, limiter.New(rdb), spool, breakers, log)
+	gcfg := gateway.DefaultConfig()
+	gcfg.AttemptTimeout, gcfg.TrustProxy = cfg.UpstreamTimeout, cfg.TrustProxy
+	gw := gateway.New(gcfg, gateway.Deps{
+		Catalog:  cache,
+		Limiter:  redisx.NewLimiter(rdb),
+		Usage:    usage,
+		Breakers: gateway.BreakersFrom(breakers),
+		Log:      log,
+	})
 	gw.RunPublisher(ctx, 4)
 
-	srv := &http.Server{
-		Addr:              config.String("ADDR", ":8080"),
-		Handler:           gw.Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-	go func() {
-		<-ctx.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		srv.Shutdown(shutdown)
-	}()
-	log.Info("gateway listening", "addr", srv.Addr)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Error("server", "err", err)
-		os.Exit(1)
+	if err := run.Serve(ctx, log, cfg.Addr, gw.Router()); err != nil {
+		run.Fatal(log, "server", err)
 	}
 }

@@ -54,9 +54,10 @@ jobs:
           psql -h localhost -U apimarket -d apimarket -v ON_ERROR_STOP=1 -q -f migrations/postgres/0001_init.sql
           psql -h localhost -U apimarket -d apimarket -v ON_ERROR_STOP=1 -q -f deploy/seed/seed.sql
 
-      - name: Tests (race detector; limiter tests use the real Redis service)
+      - name: Tests (race detector; adapters tested against the real Postgres and Redis services)
         env:
           REDIS_ADDR: localhost:6379
+          TEST_DATABASE_URL: postgres://apimarket:apimarket@localhost:5432/apimarket?sslmode=disable
         run: go test -race -count=1 -coverprofile=coverage.out ./...
 
       - name: Coverage summary

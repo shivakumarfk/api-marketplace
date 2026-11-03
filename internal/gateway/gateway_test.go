@@ -14,12 +14,17 @@ import (
 	"testing"
 	"time"
 
-	"apimarket/internal/apikey"
-	"apimarket/internal/breaker"
-	"apimarket/internal/catalog"
-	"apimarket/internal/events"
-	"apimarket/internal/limiter"
+	"github.com/gin-gonic/gin"
+
+	"apimarket/internal/domain"
+	"apimarket/internal/domain/apikey"
+	"apimarket/internal/domain/catalog"
+	"apimarket/internal/domain/limits"
+	"apimarket/internal/domain/usage"
+	"apimarket/internal/platform/breaker"
 )
+
+func init() { gin.SetMode(gin.TestMode) }
 
 const (
 	liveKey = "mk_live_" + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -32,19 +37,19 @@ func (s staticSnap) Current() *catalog.Snapshot { return s.s }
 
 type fakeLimiter struct {
 	mu      sync.Mutex
-	result  limiter.Result
+	result  limits.Result
 	checks  int
 	refunds int
 }
 
-func (f *fakeLimiter) Check(context.Context, limiter.Request) (limiter.Outcome, error) {
+func (f *fakeLimiter) Check(context.Context, limits.Request) (limits.Outcome, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.checks++
-	return limiter.Outcome{Result: f.result, QuotaRemaining: -1, BalanceMicro: -1}, nil
+	return limits.Outcome{Result: f.result, QuotaRemaining: -1, BalanceMicro: -1}, nil
 }
 
-func (f *fakeLimiter) Refund(context.Context, limiter.Request) error {
+func (f *fakeLimiter) Refund(context.Context, limits.Request) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.refunds++
@@ -53,17 +58,17 @@ func (f *fakeLimiter) Refund(context.Context, limiter.Request) error {
 
 type capturePub struct {
 	mu  sync.Mutex
-	got []events.Usage
+	got []usage.Event
 }
 
-func (c *capturePub) Publish(_ context.Context, u events.Usage) error {
+func (c *capturePub) Publish(_ context.Context, u usage.Event) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.got = append(c.got, u)
 	return nil
 }
 
-func (c *capturePub) last(t *testing.T) events.Usage {
+func (c *capturePub) last(t *testing.T) usage.Event {
 	t.Helper()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -97,13 +102,13 @@ func setup(t *testing.T, provider http.HandlerFunc, mutate func(*catalog.Snapsho
 
 	now := time.Now()
 	s := catalog.Empty()
-	s.KeysByHash[apikey.Hash(liveKey)] = catalog.Key{ID: "key1", OrgID: "org1", Env: "production", Status: "active"}
-	s.KeysByHash[apikey.Hash(testKey)] = catalog.Key{ID: "key2", OrgID: "org1", Env: "sandbox", Status: "active"}
-	s.Orgs["org1"] = catalog.Org{ID: "org1", BillingMode: "prepaid", Status: "active"}
-	s.APIsBySlug["weather"] = catalog.API{ID: "api1", Slug: "weather", BaseURL: prov.URL, MockURL: mock.URL,
-		AuthType: "api_key", AuthHeader: "X-Provider-Key", Secret: "upstream-secret", Status: "published"}
-	s.Plans["plan1"] = catalog.Plan{ID: "plan1", Kind: "payg", PricePerCallMicro: 50_000, ProviderCostMicro: 30_000}
-	s.Subs[catalog.SubKey("org1", "api1")] = catalog.Subscription{ID: "sub1", OrgID: "org1", APIID: "api1", PlanID: "plan1",
+	s.KeysByHash[apikey.Hash(liveKey)] = domain.APIKey{ID: "key1", OrgID: "org1", Env: domain.EnvProduction, Status: "active"}
+	s.KeysByHash[apikey.Hash(testKey)] = domain.APIKey{ID: "key2", OrgID: "org1", Env: domain.EnvSandbox, Status: "active"}
+	s.Orgs["org1"] = domain.Org{ID: "org1", BillingMode: domain.Prepaid, Status: "active"}
+	s.APIsBySlug["weather"] = catalog.API{API: domain.API{ID: "api1", Slug: "weather", BaseURL: prov.URL, MockURL: mock.URL,
+		AuthType: "api_key", AuthHeader: "X-Provider-Key", Status: "published"}, Secret: "upstream-secret"}
+	s.Plans["plan1"] = domain.Plan{ID: "plan1", Kind: domain.PlanPAYG, PricePerCall: 50_000, ProviderCostPerCall: 30_000}
+	s.Subs[catalog.SubKey("org1", "api1")] = domain.Subscription{ID: "sub1", OrgID: "org1", APIID: "api1", PlanID: "plan1",
 		Status: "active", PeriodStart: now.Add(-time.Hour), PeriodEnd: now.Add(time.Hour)}
 	if mutate != nil {
 		mutate(s)
@@ -114,9 +119,9 @@ func setup(t *testing.T, provider http.HandlerFunc, mutate func(*catalog.Snapsho
 	cfg := DefaultConfig()
 	cfg.AttemptTimeout = 2 * time.Second
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	gw := New(cfg, staticSnap{s}, lim, pub, breaker.NewSet(3, time.Minute, nil), log)
-	gw.eventsCh = make(chan events.Usage) // unbuffered + no workers → publishes inline, deterministic
-	srv := httptest.NewServer(gw.Handler())
+	gw := New(cfg, Deps{Catalog: staticSnap{s}, Limiter: lim, Usage: pub, Breakers: BreakersFrom(breaker.NewSet(3, time.Minute, nil)), Log: log})
+	gw.events = make(chan usage.Event) // unbuffered + no workers → publishes inline, deterministic
+	srv := httptest.NewServer(gw.Router())
 	t.Cleanup(srv.Close)
 	return &env{gw: gw, srv: srv, lim: lim, pub: pub, provider: prov, hits: &hits}
 }
@@ -146,7 +151,7 @@ func errCode(m map[string]any) string {
 
 func TestAuthAndRouting(t *testing.T) {
 	e := setup(t, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{}`)) }, func(s *catalog.Snapshot) {
-		s.APIsBySlug["maps"] = catalog.API{ID: "api2", Slug: "maps", BaseURL: "http://unused", Status: "published"}
+		s.APIsBySlug["maps"] = catalog.API{API: domain.API{ID: "api2", Slug: "maps", BaseURL: "http://unused", Status: "published"}}
 	})
 	cases := []struct {
 		path, key string
@@ -163,7 +168,7 @@ func TestAuthAndRouting(t *testing.T) {
 		if resp.StatusCode != c.status || errCode(m) != c.code {
 			t.Errorf("%s key=%q: got %d %q, want %d %q", c.path, c.key, resp.StatusCode, errCode(m), c.status, c.code)
 		}
-		if resp.Header.Get("X-Request-Id") == "" {
+		if resp.Header.Get("X-Request-Id") == "" || resp.Header.Get("X-Request-Id") != m["error"].(map[string]any)["request_id"] {
 			t.Error("missing X-Request-Id")
 		}
 	}
@@ -178,7 +183,7 @@ func TestExpiredRevokedAndIPAllowlist(t *testing.T) {
 		k := s.KeysByHash[apikey.Hash(liveKey)]
 		k.IPAllow = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
 		s.KeysByHash[apikey.Hash(liveKey)] = k
-		s.KeysByHash[apikey.Hash(testKey)] = catalog.Key{ID: "k", OrgID: "org1", Env: "sandbox", Status: "active", ExpiresAt: &past}
+		s.KeysByHash[apikey.Hash(testKey)] = domain.APIKey{ID: "k", OrgID: "org1", Env: domain.EnvSandbox, Status: "active", ExpiresAt: &past}
 	})
 	if resp, m := do(t, e, "GET", "/weather/x", liveKey, nil); resp.StatusCode != 403 || errCode(m) != "IP_NOT_ALLOWED" {
 		t.Errorf("allowlist: got %d %s", resp.StatusCode, errCode(m))
@@ -248,14 +253,14 @@ func TestPOSTIsNeverRetriedAndFailureRefunded(t *testing.T) {
 
 func TestLimiterRejections(t *testing.T) {
 	e := setup(t, func(w http.ResponseWriter, r *http.Request) {}, nil)
-	for res, want := range map[limiter.Result]struct {
+	for res, want := range map[limits.Result]struct {
 		status int
 		code   string
 	}{
-		limiter.RateLimited:         {429, "RATE_LIMITED"},
-		limiter.QuotaExceeded:       {429, "QUOTA_EXCEEDED"},
-		limiter.UpstreamLimited:     {429, "UPSTREAM_LIMIT"},
-		limiter.InsufficientBalance: {402, "INSUFFICIENT_BALANCE"},
+		limits.RateLimited:         {429, "RATE_LIMITED"},
+		limits.QuotaExceeded:       {429, "QUOTA_EXCEEDED"},
+		limits.UpstreamLimited:     {429, "UPSTREAM_LIMIT"},
+		limits.InsufficientBalance: {402, "INSUFFICIENT_BALANCE"},
 	} {
 		e.lim.result = res
 		resp, m := do(t, e, "GET", "/weather/x", liveKey, nil)
@@ -290,5 +295,22 @@ func TestCircuitBreakerOpens(t *testing.T) {
 	}
 	if *e.hits != 3 {
 		t.Fatalf("open circuit must not call the provider: hits %d", *e.hits)
+	}
+}
+
+func TestHealthzIsNotProxied(t *testing.T) {
+	e := setup(t, func(w http.ResponseWriter, r *http.Request) { t.Error("healthz must not reach a provider") }, nil)
+	resp, err := http.Get(e.srv.URL + "/healthz")
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("%v %v", resp, err)
+	}
+}
+
+func TestRequestBodyTooLarge(t *testing.T) {
+	e := setup(t, func(w http.ResponseWriter, r *http.Request) { t.Error("oversized body must not be forwarded") }, nil)
+	e.gw.cfg.MaxBodyBytes = 10
+	resp, m := do(t, e, "POST", "/weather/x", liveKey, strings.NewReader(strings.Repeat("a", 11)))
+	if resp.StatusCode != 413 || errCode(m) != "BODY_TOO_LARGE" || e.lim.refunds != 1 {
+		t.Fatalf("got %d %s refunds=%d", resp.StatusCode, errCode(m), e.lim.refunds)
 	}
 }
