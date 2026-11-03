@@ -8,10 +8,9 @@ The platform is a proxy/gateway in front of provider APIs. It resells them at a 
 Phase 1 (MVP), Stage 0: local development on a Mac with Docker.
 
 ## Design docs
-The requirements, architecture and cost estimate live in the **API Marketplace** Claude Project:
-- `mvp-requirements.md`: scope, roles, billing rules, non-functional requirements
-- `mvp-architecture.md`: components, gateway hot path, data model, staged deployment, testing expectations
-- `aws-cost-estimate.md`: costs for the full AWS deployment
+- [docs/mvp-requirements.md](docs/mvp-requirements.md): scope, roles, billing rules, non-functional requirements
+- [docs/mvp-architecture.md](docs/mvp-architecture.md): components, gateway hot path, data model, staged deployment, testing expectations
+- [docs/aws-cost-estimate.md](docs/aws-cost-estimate.md): costs for the full AWS deployment
 
 ## Planned layout
 ```
