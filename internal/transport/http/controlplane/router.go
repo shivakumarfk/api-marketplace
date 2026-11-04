@@ -48,6 +48,7 @@ type Deps struct {
 	Subs       Subscriber
 	Wallets    Wallets
 	Catalog    CatalogLister
+	Listing    Listing
 	AdminToken string
 	Log        *slog.Logger
 }
@@ -73,6 +74,7 @@ func Router(d Deps) *gin.Engine {
 	admin.POST("/orgs/:org/subscriptions", h.subscribe)
 	admin.POST("/orgs/:org/topups", h.topUp)
 	admin.GET("/orgs/:org/balance", h.balance)
+	registerListing(admin, h)
 
 	r.NoRoute(func(c *gin.Context) { mw.AbortWithError(c, http.StatusNotFound, "NOT_FOUND", "no such endpoint") })
 	return r

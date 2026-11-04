@@ -243,3 +243,115 @@ func TestCatalogSubscriptionsAndAudit(t *testing.T) {
 		t.Fatalf("audit row: %s %s", action, env)
 	}
 }
+
+func TestListingRepos(t *testing.T) {
+	ctx := context.Background()
+	db := testDB(t)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	prov, err := ProviderRepo{db}.Create(ctx, domain.Provider{Name: "Razorpay", AgreementSignedAt: &now, Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ProviderRepo{db}.Get(ctx, prov.ID)
+	if err != nil || got.Name != "Razorpay" || got.ContactEmail != "" || !got.AgreementSignedAt.Equal(now) {
+		t.Fatalf("%+v %v", got, err)
+	}
+	if _, err := (ProviderRepo{db}).Get(ctx, "not-a-uuid"); err != domain.ErrNotFound {
+		t.Fatal(err)
+	}
+	unsigned, _ := ProviderRepo{db}.Create(ctx, domain.Provider{Name: "Later", Status: "active"})
+	s1, err := ProviderRepo{db}.SignAgreement(ctx, unsigned.ID, now)
+	if err != nil || s1.AgreementSignedAt == nil || !s1.AgreementSignedAt.Equal(now) {
+		t.Fatalf("%+v %v", s1, err)
+	}
+	if s2, _ := (ProviderRepo{db}).SignAgreement(ctx, unsigned.ID, now.Add(time.Hour)); !s2.AgreementSignedAt.Equal(now) {
+		t.Fatal("re-signing keeps the first date")
+	}
+	if _, err := (ProviderRepo{db}).SignAgreement(ctx, "00000000-0000-0000-0000-000000000000", now); err != domain.ErrNotFound {
+		t.Fatal(err)
+	}
+	if list, _ := (ProviderRepo{db}).List(ctx); len(list) != 2 {
+		t.Fatal(list)
+	}
+
+	apis := APIRepo{db}
+	a, err := apis.Create(ctx, domain.API{ProviderID: prov.ID, Slug: "ifsc", Name: "IFSC", Category: "finance",
+		BaseURL: "https://ifsc.razorpay.com", AuthType: "none", Status: "draft"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := apis.Create(ctx, domain.API{ProviderID: prov.ID, Slug: "ifsc", Name: "dup", BaseURL: "http://x", AuthType: "none", Status: "draft"}); err == nil {
+		t.Fatal("duplicate slug")
+	} else if e, ok := domain.AsError(err); !ok || e.Kind != domain.KindConflict {
+		t.Fatalf("duplicate slug must be a conflict: %v", err)
+	}
+	if _, err := apis.Create(ctx, domain.API{ProviderID: "00000000-0000-0000-0000-000000000000", Slug: "orphan", Name: "o", BaseURL: "http://x", AuthType: "none", Status: "draft"}); err != domain.ErrNotFound {
+		t.Fatalf("unknown provider: %v", err)
+	}
+
+	a.AuthType, a.AuthHeader, a.SecretSealed, a.UpstreamRPS, a.MockURL = "api_key", "X-Key", "sealed!", 5, "http://mock"
+	if err := apis.Update(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := apis.SetStatus(ctx, a.ID, "published"); err != nil {
+		t.Fatal(err)
+	}
+	g, err := apis.GetBySlug(ctx, "ifsc")
+	if err != nil || g.SecretSealed != "sealed!" || g.AuthHeader != "X-Key" || g.UpstreamRPS != 5 || g.MockURL != "http://mock" || g.Status != "published" {
+		t.Fatalf("%+v %v", g, err)
+	}
+	if g2, err := apis.GetByID(ctx, a.ID); err != nil || g2.Slug != "ifsc" {
+		t.Fatalf("%+v %v", g2, err)
+	}
+	a.AuthType, a.AuthHeader, a.SecretSealed, a.UpstreamRPS, a.MockURL = "none", "", "", 0, ""
+	apis.Update(ctx, a)
+	g, _ = apis.GetBySlug(ctx, "ifsc")
+	if g.SecretSealed != "" || g.AuthHeader != "" || g.UpstreamRPS != 0 || g.MockURL != "" || g.Status != "published" {
+		t.Fatalf("cleared fields, status unchanged: %+v", g)
+	}
+	if err := apis.Update(ctx, domain.API{ID: "00000000-0000-0000-0000-000000000000", AuthType: "none"}); err != domain.ErrNotFound {
+		t.Fatal(err)
+	}
+	if err := apis.SetStatus(ctx, a.ID, "bogus"); err == nil {
+		t.Fatal("status check constraint")
+	}
+
+	plans := PlanRepo{db}
+	p1, err := plans.Create(ctx, domain.Plan{APIID: a.ID, Name: "PAYG", Kind: domain.PlanPAYG, PricePerCall: 20_000, RateLimitRPS: 2, Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plans.Create(ctx, domain.Plan{APIID: a.ID, Name: "Loss", Kind: domain.PlanPAYG, PricePerCall: 1, ProviderCostPerCall: 2, Status: "active"}); err == nil {
+		t.Fatal("DB must reject negative margin")
+	}
+	p2, _ := plans.Create(ctx, domain.Plan{APIID: a.ID, Name: "Free", Kind: domain.PlanFree, IncludedCalls: 100, Status: "active"})
+	if list, err := plans.ListByAPI(ctx, a.ID); err != nil || len(list) != 2 || list[0].ID != p2.ID {
+		t.Fatalf("free plan sorts first: %+v %v", list, err)
+	}
+
+	// A retired plan stays in the gateway snapshot while someone is subscribed to it.
+	o := mustOrg(t, db, domain.OrgIndividual, "")
+	start, end := domain.MonthlyPeriod(time.Now())
+	if _, err := (SubscriptionRepo{db}).Upsert(ctx, domain.Subscription{OrgID: o.ID, APIID: a.ID, PlanID: p1.ID, PeriodStart: start, PeriodEnd: end}); err != nil {
+		t.Fatal(err)
+	}
+	plans.SetStatus(ctx, p1.ID, "retired")
+	plans.SetStatus(ctx, p2.ID, "retired")
+	if g, _ := plans.Get(ctx, p1.ID); g.Status != "retired" {
+		t.Fatal(g)
+	}
+	snap, err := SnapshotSource{DB: db, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := snap.Plans[p1.ID]; !ok {
+		t.Fatal("retired plan with a subscriber must stay in the snapshot")
+	}
+	if _, ok := snap.Plans[p2.ID]; ok {
+		t.Fatal("retired plan without subscribers must not be in the snapshot")
+	}
+	if _, _, err := (CatalogRepo{db}).FindPlan(ctx, "ifsc", p1.ID); err != domain.ErrNotFound {
+		t.Fatal("retired plans accept no new subscriptions")
+	}
+}

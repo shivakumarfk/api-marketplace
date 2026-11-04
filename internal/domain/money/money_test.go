@@ -50,3 +50,47 @@ func TestToPaiseErrorBound(t *testing.T) {
 		}
 	}
 }
+
+func TestParseRupeesAndDecimal(t *testing.T) {
+	ok := []struct {
+		in   string
+		want Micro
+		dec  string
+	}{
+		{"", 0, "0.00"},
+		{"0", 0, "0.00"},
+		{"499", 499_000_000, "499.00"},
+		{"0.02", 20_000, "0.02"},
+		{"0.000001", 1, "0.000001"},
+		{"12.5", 12_500_000, "12.50"},
+		{"007.10", 7_100_000, "7.10"},
+	}
+	for _, c := range ok {
+		got, err := ParseRupees(c.in)
+		if err != nil || got != c.want {
+			t.Errorf("ParseRupees(%q) = %d, %v; want %d", c.in, got, err, c.want)
+		}
+		if d := got.Decimal(); d != c.dec {
+			t.Errorf("Micro(%d).Decimal() = %q, want %q", got, d, c.dec)
+		}
+	}
+	for _, bad := range []string{"-1", "1.", ".5", "0.0000001", "1e3", "1,000", "₹5", " 5", "abc", "1.2.3", "9999999999999"} {
+		if _, err := ParseRupees(bad); err == nil {
+			t.Errorf("ParseRupees(%q) must fail", bad)
+		}
+	}
+	if Micro(-20_000).Decimal() != "-0.02" {
+		t.Error("negative decimal")
+	}
+}
+
+func TestParseRupeesRoundTrip(t *testing.T) {
+	r := rand.New(rand.NewSource(1))
+	for range 1000 {
+		m := Micro(r.Int63n(int64(FromRupees(1_000_000))))
+		got, err := ParseRupees(m.Decimal())
+		if err != nil || got != m {
+			t.Fatalf("round trip %d → %q → %d %v", m, m.Decimal(), got, err)
+		}
+	}
+}

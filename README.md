@@ -12,7 +12,7 @@ The platform is a proxy/gateway in front of provider APIs. It resells them at a 
 - [docs/aws-cost-estimate.md](docs/aws-cost-estimate.md): costs for the full AWS deployment
 
 ## Quick start (Mac)
-Needs Docker Desktop (give it ~8 GB RAM). Go 1.24+ is only needed to run tests outside Docker.
+Needs Docker Desktop (give it ~8 GB RAM). Go 1.25+ is only needed to run tests outside Docker.
 
 ```bash
 git clone https://github.com/shivakumarfk/api-marketplace && cd api-marketplace
@@ -20,6 +20,8 @@ make up      # builds and starts everything with seed data
 make demo    # walks through the main gateway behaviours
 make logs    # follow gateway / control plane / metering logs
 make reset   # wipe local data and start fresh
+make seed-real   # add real public APIs (Open-Meteo, IFSC, JSONPlaceholder, httpbin) to a running stack
+make demo-real   # call them through the gateway (needs internet)
 ```
 
 | What | Where |
@@ -50,13 +52,14 @@ All HTTP is served with Gin. Every layer talks to the next through interfaces (s
   - create and revoke keys
   - subscribe to plans
   - prepaid top-ups through a balanced double-entry ledger
+  - list APIs: onboard providers, add APIs as drafts (provider credential encrypted before storage, never returned), price them with plans, publish and suspend
   - all actions written to an audit log
   - Redis balances rebuilt from the ledger on startup
 - **Database guards:** the ledger must balance and is append-only. Individuals must be prepaid; institutions must be postpaid and have a well-formed GSTIN. Price can't be below provider cost.
 
 ## Not built yet (next steps)
 - Posting usage to the ledger, Redis-vs-ledger reconciliation, postpaid invoices with GST, provider statements, and the payment gateway
-- Google sign-in, the customer console and catalog UI (`web/`), provider onboarding and approval workflow, OpenAPI ingestion, snippets
+- Google sign-in, the customer console and catalog UI (`web/`), provider self-service onboarding and the review/approval workflow, OpenAPI ingestion, snippets
 - Alert engine and email/in-app notifications; OpenTelemetry instrumentation feeding SigNoz
 
 ## Admin API (Stage 0)
@@ -72,8 +75,30 @@ All admin calls need `Authorization: Bearer dev-admin-token`.
 | POST | `/v1/admin/orgs/{org}/topups` | `{"amount_rupees","payment_ref"}`, prepaid only; the same `payment_ref` can't be credited twice |
 | GET | `/v1/admin/orgs/{org}/balance` | |
 
+**Listing APIs.** An API starts as a draft. To publish it, its provider must have signed the resale agreement and it needs at least one active plan. Changes reach the gateway within its catalog refresh (5 s). Amounts are exact rupee strings such as `"0.02"`, never JSON numbers.
+
+| Method | Path | Body |
+|---|---|---|
+| POST | `/v1/admin/providers` | `{"name","contact_email","agreement_signed":bool}` |
+| GET | `/v1/admin/providers` | |
+| POST | `/v1/admin/providers/{id}/agreement` | records the agreement as signed now (repeat calls keep the first date) |
+| POST | `/v1/admin/apis` | `{"provider_id","slug","name","description","category","base_url","mock_url","auth":{"type":"none\|api_key","header","secret"},"upstream_rate_limit_rps"}` |
+| GET | `/v1/admin/apis` | every API in any status, with all plans; credentials show only `has_secret` |
+| GET / PATCH | `/v1/admin/apis/{slug}` | PATCH takes any of the create fields except `provider_id` and `slug`; with `auth` but no `secret`, an `api_key` API keeps its stored secret |
+| POST | `/v1/admin/apis/{slug}/publish` · `/suspend` | suspending stops calls (404) but keeps subscriptions |
+| POST | `/v1/admin/apis/{slug}/plans` | `{"name","kind":"free\|tier\|payg","monthly_fee","included_calls","price_per_call","provider_cost_per_call","rate_limit_rps"}` |
+| POST | `/v1/admin/plans/{id}/retire` | stops new subscriptions; existing subscribers keep the plan |
+
+```bash
+A="Authorization: Bearer dev-admin-token"
+curl -s -H "$A" -d '{"name":"Postman","agreement_signed":true}' localhost:8081/v1/admin/providers     # → id
+curl -s -H "$A" -d '{"provider_id":"<id>","slug":"postman-echo","name":"Postman Echo","base_url":"https://postman-echo.com"}' localhost:8081/v1/admin/apis
+curl -s -H "$A" -d '{"name":"PAYG","kind":"payg","price_per_call":"0.03"}' localhost:8081/v1/admin/apis/postman-echo/plans
+curl -s -H "$A" -X POST localhost:8081/v1/admin/apis/postman-echo/publish
+```
+
 ## Code structure
-Go 1.24, **Gin** for HTTP, **pgx** for PostgreSQL, **go-redis** for Redis. Interfaces sit at every boundary, and dependencies point inward:
+Go 1.25, **Gin** for HTTP, **pgx** for PostgreSQL, **go-redis** for Redis. Interfaces sit at every boundary, and dependencies point inward:
 
 ```
 cmd/                         wiring only: build adapters, inject them (no DI framework)
