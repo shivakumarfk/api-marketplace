@@ -77,10 +77,10 @@ var forbiddenAuthHeaders = map[string]bool{
 
 func ValidateSlug(s string) error {
 	if !slugRe.MatchString(s) {
-		return Invalid("INVALID_SLUG", "slug must be 2-63 characters: lowercase letters, digits and hyphens, not starting with a hyphen")
+		return Invalid("INVALID_SLUG", "API path must be 2-63 characters: lowercase letters, digits and hyphens, not starting with a hyphen")
 	}
 	if reservedSlugs[s] {
-		return Invalid("RESERVED_SLUG", "slug "+s+" is reserved")
+		return Invalid("RESERVED_SLUG", "API path /"+s+" is reserved")
 	}
 	return nil
 }

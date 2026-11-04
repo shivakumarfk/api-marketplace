@@ -3,9 +3,30 @@ import { env, unique } from "./env";
 
 // cp: the admin API directly, for steps with no UI yet (subscribing an org).
 // gateway: customer calls with the seeded institution key.
-type Fixtures = { cp: APIRequestContext; gateway: APIRequestContext };
+// cleanup (automatic): suspends every API the test created, pass or fail, so
+// test APIs never stay in the public catalog.
+type Fixtures = { cp: APIRequestContext; gateway: APIRequestContext; cleanup: void };
+
+const createdByTest = new Map<string, string[]>();
+
+function track(slug: string) {
+  const id = base.info().testId;
+  createdByTest.set(id, [...(createdByTest.get(id) ?? []), slug]);
+}
 
 export const test = base.extend<Fixtures>({
+  cleanup: [
+    async ({ cp }, provide, testInfo) => {
+      await provide();
+      for (const slug of createdByTest.get(testInfo.testId) ?? []) {
+        // 409 NOT_PUBLISHED (still a draft, or already suspended) is fine.
+        const res = await cp.post(`/v1/admin/apis/${slug}/suspend`);
+        if (![200, 409].includes(res.status())) throw new Error(`cleanup of ${slug}: ${res.status()} ${await res.text()}`);
+      }
+      createdByTest.delete(testInfo.testId);
+    },
+    { auto: true },
+  ],
   cp: async ({ playwright }, provide) => {
     const ctx = await playwright.request.newContext({
       baseURL: env.controlPlane,
@@ -39,7 +60,7 @@ export async function createAPI(page: Page, opts: { provider: string; slug?: str
   const slug = opts.slug ?? unique();
   await page.goto("/admin/apis/new");
   await page.getByLabel("Provider", { exact: true }).selectOption({ label: opts.provider });
-  await page.getByLabel("Slug").fill(slug);
+  await page.getByLabel("API path").fill(slug);
   await page.getByLabel("Name", { exact: true }).fill(`E2E ${slug}`);
   await page.getByLabel("Category").fill("testing");
   await page.getByLabel("Base URL").fill(env.mockProviderURL);
@@ -48,6 +69,7 @@ export async function createAPI(page: Page, opts: { provider: string; slug?: str
   await page.getByLabel("Provider secret").fill(opts.secret ?? env.mockProviderSecret);
   await page.getByRole("button", { name: "Create draft" }).click();
   await expect(page).toHaveURL(new RegExp(`/admin/apis/${slug}$`));
+  track(slug);
   await expect(page.getByTestId("status").first()).toHaveText("draft");
   return slug;
 }

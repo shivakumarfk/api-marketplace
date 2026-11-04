@@ -23,10 +23,10 @@ async function APITable() {
   const [apis, providers] = await Promise.all([listAPIs(), listProviders()]);
   const providerName = new Map(providers.map((p) => [p.id, p.name]));
   return (
-    <Table head={["Slug", "Name", "Provider", "Status", "Active plans", "Upstream auth"]} empty="No APIs yet.">
+    <Table head={["API path", "Name", "Provider", "Status", "Active plans", "Upstream auth"]} empty="No APIs yet.">
       {apis.map((a) => (
         <tr key={a.id} data-testid={`api-row-${a.slug}`}>
-          <Td><Link href={`/admin/apis/${a.slug}`} className="font-mono text-indigo-700 hover:underline">{a.slug}</Link></Td>
+          <Td><Link href={`/admin/apis/${a.slug}`} className="font-mono text-indigo-700 hover:underline">/{a.slug}</Link></Td>
           <Td>{a.name}</Td>
           <Td>{providerName.get(a.provider_id) ?? a.provider_id}</Td>
           <Td><Badge status={a.status} /></Td>

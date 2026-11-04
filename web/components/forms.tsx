@@ -72,15 +72,15 @@ export function ProviderForm() {
   );
 }
 
-export function ApiForm({ mode, providers, api, action }: {
-  mode: "create" | "update"; providers: Provider[]; api?: AdminAPI; action: BoundAction;
+export function ApiForm({ mode, providers, api, action, gateway }: {
+  mode: "create" | "update"; providers: Provider[]; api?: AdminAPI; action: BoundAction; gateway: string;
 }) {
   const [state, formAction, pending] = useActionState(action, initial);
-  return <ApiFormBody key={formKey(state)} mode={mode} providers={providers} api={api} state={state} formAction={formAction} pending={pending} />;
+  return <ApiFormBody key={formKey(state)} mode={mode} providers={providers} api={api} state={state} formAction={formAction} pending={pending} gateway={gateway} />;
 }
 
-function ApiFormBody({ mode, providers, api, state, formAction, pending }: {
-  mode: "create" | "update"; providers: Provider[]; api?: AdminAPI; state: FormState; formAction: (fd: FormData) => void; pending: boolean;
+function ApiFormBody({ mode, providers, api, state, formAction, pending, gateway }: {
+  mode: "create" | "update"; providers: Provider[]; api?: AdminAPI; state: FormState; formAction: (fd: FormData) => void; pending: boolean; gateway: string;
 }) {
   const [authType, setAuthType] = useState(pick(state, "auth_type", api?.auth.type ?? "none"));
   const v = (k: string, fallback?: string | number) => pick(state, k, fallback === undefined ? "" : String(fallback));
@@ -94,13 +94,13 @@ function ApiFormBody({ mode, providers, api, state, formAction, pending }: {
               {providers.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
             </Select>
           </Field>
-          <Field label="Slug" htmlFor="slug" hint="First path segment on the gateway; cannot change later.">
+          <Field label="API path" htmlFor="slug" hint={<>Customers call <code className="font-mono">{gateway}/&lt;API path&gt;/…</code>. Lowercase letters, digits and hyphens; cannot change later.</>}>
             <Input id="slug" name="slug" required pattern="[a-z0-9][a-z0-9\-]{1,62}" placeholder="ifsc" defaultValue={v("slug")} />
           </Field>
         </>
       ) : (
         <p className="text-sm text-gray-500 sm:col-span-2">
-          Slug <code className="font-mono">{api?.slug}</code> and provider are fixed once created.
+          API path <code className="font-mono">/{api?.slug}</code> and provider are fixed once created.
         </p>
       )}
       <Field label="Name" htmlFor="name">

@@ -20,3 +20,12 @@ test.describe("public catalog", () => {
     await expect(page.getByTestId(`catalog-${slug}`)).toHaveCount(0);
   });
 });
+
+test("cards line up: same height in every row", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto("/");
+  const cards = page.locator('[data-testid^="catalog-"]');
+  await expect(cards.first()).toBeVisible();
+  const heights = new Set((await cards.evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().height)))));
+  expect([...heights]).toHaveLength(1);
+});

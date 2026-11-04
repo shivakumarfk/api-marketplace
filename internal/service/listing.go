@@ -126,7 +126,7 @@ func (s *ListingService) CreateAPI(ctx context.Context, actor domain.Actor, in C
 		}
 		created, err := s.APIs.Create(ctx, a)
 		if e, ok := domain.AsError(err); ok && e.Kind == domain.KindConflict {
-			return domain.Conflict("SLUG_TAKEN", "another API already uses the slug "+a.Slug)
+			return domain.Conflict("SLUG_TAKEN", "another API already uses the API path /"+a.Slug)
 		}
 		if err != nil {
 			return err
@@ -361,7 +361,7 @@ func (s *ListingService) applySecret(a *domain.API, secret string) error {
 func (s *ListingService) getAPI(ctx context.Context, slug string) (domain.API, error) {
 	a, err := s.APIs.GetBySlug(ctx, slug)
 	if errors.Is(err, domain.ErrNotFound) {
-		return domain.API{}, domain.NotFound("API_NOT_FOUND", "no API with slug "+slug)
+		return domain.API{}, domain.NotFound("API_NOT_FOUND", "no API at path /"+slug)
 	}
 	return a, err
 }

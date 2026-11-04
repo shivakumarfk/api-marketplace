@@ -13,14 +13,14 @@ test("API form shows control-plane errors inline and keeps the input", async ({ 
   for (const [slug, baseURL, code] of cases) {
     await page.goto("/admin/apis/new");
     await page.getByLabel("Provider", { exact: true }).selectOption({ label: provider });
-    await page.getByLabel("Slug").fill(slug);
+    await page.getByLabel("API path").fill(slug);
     await page.getByLabel("Name", { exact: true }).fill("Keep me");
     await page.getByLabel("Base URL").fill(baseURL);
     await page.getByRole("button", { name: "Create draft" }).click();
     await expect(page.getByTestId("error-code"), slug).toHaveText(code);
     await expect(page).toHaveURL(/\/admin\/apis\/new$/);
     await expect(page.getByLabel("Name", { exact: true })).toHaveValue("Keep me");
-    await expect(page.getByLabel("Slug")).toHaveValue(slug);
+    await expect(page.getByLabel("API path")).toHaveValue(slug);
     await expect(page.getByLabel("Base URL")).toHaveValue(baseURL);
   }
 });

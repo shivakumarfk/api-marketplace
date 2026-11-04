@@ -70,7 +70,7 @@ async function APIDetail({ params }: Pick<PageProps<"/admin/apis/[slug]">, "para
       </Card>
 
       <Card title="Listing and upstream">
-        <ApiForm key={JSON.stringify(api)} mode="update" providers={providers} api={api} action={updateAPI.bind(null, api.slug)} />
+        <ApiForm key={JSON.stringify(api)} mode="update" providers={providers} api={api} action={updateAPI.bind(null, api.slug)} gateway={gateway} />
       </Card>
     </div>
   );
