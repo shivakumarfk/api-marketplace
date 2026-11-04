@@ -1,8 +1,8 @@
 "use client";
 
-import { useActionState, useState } from "react";
+import { Fragment, useActionState, useId, useState } from "react";
 import * as actions from "@/app/admin/actions";
-import type { AdminAPI, FormState, Provider } from "@/lib/types";
+import type { AdminAPI, Endpoint, FormState, Provider } from "@/lib/types";
 import { Button, ErrorNote, Field, Input, OkNote, Select, Textarea } from "./ui";
 
 const initial: FormState = {};
@@ -72,15 +72,15 @@ export function ProviderForm() {
   );
 }
 
-export function ApiForm({ mode, providers, api, action }: {
-  mode: "create" | "update"; providers: Provider[]; api?: AdminAPI; action: BoundAction;
+export function ApiForm({ mode, providers, api, action, gateway }: {
+  mode: "create" | "update"; providers: Provider[]; api?: AdminAPI; action: BoundAction; gateway: string;
 }) {
   const [state, formAction, pending] = useActionState(action, initial);
-  return <ApiFormBody key={formKey(state)} mode={mode} providers={providers} api={api} state={state} formAction={formAction} pending={pending} />;
+  return <ApiFormBody key={formKey(state)} mode={mode} providers={providers} api={api} state={state} formAction={formAction} pending={pending} gateway={gateway} />;
 }
 
-function ApiFormBody({ mode, providers, api, state, formAction, pending }: {
-  mode: "create" | "update"; providers: Provider[]; api?: AdminAPI; state: FormState; formAction: (fd: FormData) => void; pending: boolean;
+function ApiFormBody({ mode, providers, api, state, formAction, pending, gateway }: {
+  mode: "create" | "update"; providers: Provider[]; api?: AdminAPI; state: FormState; formAction: (fd: FormData) => void; pending: boolean; gateway: string;
 }) {
   const [authType, setAuthType] = useState(pick(state, "auth_type", api?.auth.type ?? "none"));
   const v = (k: string, fallback?: string | number) => pick(state, k, fallback === undefined ? "" : String(fallback));
@@ -94,13 +94,13 @@ function ApiFormBody({ mode, providers, api, state, formAction, pending }: {
               {providers.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
             </Select>
           </Field>
-          <Field label="Slug" htmlFor="slug" hint="First path segment on the gateway; cannot change later.">
+          <Field label="API path" htmlFor="slug" hint={<>Customers call <code className="font-mono">{gateway}/&lt;API path&gt;/…</code>. Lowercase letters, digits and hyphens; cannot change later.</>}>
             <Input id="slug" name="slug" required pattern="[a-z0-9][a-z0-9\-]{1,62}" placeholder="ifsc" defaultValue={v("slug")} />
           </Field>
         </>
       ) : (
         <p className="text-sm text-gray-500 sm:col-span-2">
-          Slug <code className="font-mono">{api?.slug}</code> and provider are fixed once created.
+          API path <code className="font-mono">/{api?.slug}</code> and provider are fixed once created.
         </p>
       )}
       <Field label="Name" htmlFor="name">
@@ -120,30 +120,42 @@ function ApiFormBody({ mode, providers, api, state, formAction, pending }: {
       <Field label="Mock URL (sandbox keys)" htmlFor="mock_url">
         <Input id="mock_url" name="mock_url" defaultValue={v("mock_url", api?.mock_url)} />
       </Field>
-      <Field label="Upstream auth" htmlFor="auth_type">
+      <Field label="Upstream auth" htmlFor="auth_type" hint="How the gateway authenticates to the provider. Customers never see this.">
         <Select id="auth_type" name="auth_type" value={authType} onChange={(e) => setAuthType(e.target.value)}>
           <option value="none">None</option>
           <option value="api_key">API key in a header</option>
+          <option value="bearer">Bearer token (Authorization: Bearer …)</option>
+          <option value="basic">Basic auth (user:password)</option>
+          <option value="query">API key in a query parameter</option>
         </Select>
       </Field>
       <Field label="Provider rate limit (req/s)" htmlFor="upstream_rate_limit_rps" hint="Shared across all customers. 0 = unlimited.">
         <Input id="upstream_rate_limit_rps" name="upstream_rate_limit_rps" inputMode="decimal" defaultValue={v("upstream_rate_limit_rps", api?.upstream_rate_limit_rps ?? 0)} />
       </Field>
-      {authType === "api_key" && (
-        <>
-          <Field label="Header name" htmlFor="auth_header">
-            <Input id="auth_header" name="auth_header" required placeholder="X-Api-Key" defaultValue={v("auth_header", api?.auth.header)} />
-          </Field>
-          <Field
-            label="Provider secret"
-            htmlFor="secret"
-            hint={api?.auth.has_secret ? "A secret is stored. Leave blank to keep it; type a new one to rotate." : "Encrypted before storage; never shown again."}
-          >
-            <Input id="secret" name="secret" type="password" autoComplete="new-password"
-              required={!(api?.auth.type === "api_key" && api.auth.has_secret)} />
-          </Field>
-        </>
+      {(authType === "api_key" || authType === "query") && (
+        <Field label={authType === "api_key" ? "Header name" : "Query parameter name"} htmlFor="auth_header">
+          <Input id="auth_header" name="auth_header" required placeholder={authType === "api_key" ? "X-Api-Key" : "api_key"}
+            defaultValue={v("auth_header", api?.auth.type === authType ? api?.auth.header : "")} />
+        </Field>
       )}
+      {authType !== "none" && (
+        <Field
+          label={{ api_key: "Provider API key", query: "Provider API key", bearer: "Bearer token", basic: "user:password" }[authType] ?? "Provider secret"}
+          htmlFor="secret"
+          hint={secretKept(api, authType) ? "A secret is stored. Leave blank to keep it; type a new one to rotate." : "Encrypted before storage; never shown again."}
+        >
+          <Input id="secret" name="secret" type="password" autoComplete="new-password" required={!secretKept(api, authType)} />
+        </Field>
+      )}
+      <div className="sm:col-span-2">
+        <Field label="Fixed headers sent to the provider" htmlFor="upstream_headers"
+          hint="Non-secret values added to every upstream call, e.g. a client id or API version. They override what customers send.">
+          <RowEditor id="upstream_headers" name="upstream_headers_json"
+            initial={rowsFrom(state, "upstream_headers_json", api?.upstream_headers ?? [])}
+            columns={[{ key: "name", label: "Header", placeholder: "X-Client-Id" }, { key: "value", label: "Value", placeholder: "acme" }]}
+            blank={{ name: "", value: "" }} addLabel="Add header" />
+        </Field>
+      </div>
       <div className="flex flex-col gap-2 sm:col-span-2">
         <ErrorNote error={state.error} />
         <OkNote ok={state.ok} />
@@ -199,6 +211,164 @@ function PlanFormBody({ state, formAction, pending }: { state: FormState; formAc
         <ErrorNote error={state.error} />
         <OkNote ok={state.ok} />
         <div><Button type="submit" disabled={pending}>Add plan</Button></div>
+      </div>
+    </form>
+  );
+}
+
+// An empty secret keeps the stored one when the type stays key-like (or basic stays basic).
+function secretKept(api: AdminAPI | undefined, to: string): boolean {
+  if (!api?.auth.has_secret) return false;
+  const keyLike = ["api_key", "bearer", "query"];
+  return (keyLike.includes(api.auth.type) && keyLike.includes(to)) || (api.auth.type === "basic" && to === "basic");
+}
+
+// rowsFrom restores a row editor after an error (from the submitted JSON),
+// otherwise starts from the stored rows.
+function rowsFrom<T>(state: FormState, field: string, stored: T[]): T[] {
+  const raw = state.values?.[field];
+  if (raw) {
+    try {
+      return JSON.parse(raw) as T[];
+    } catch {
+      // fall through to stored rows
+    }
+  }
+  return stored;
+}
+
+type Column = { key: string; label: string; placeholder?: string; type?: "text" | "checkbox" | "select"; options?: string[]; width?: string };
+type Row = Record<string, string | boolean>;
+
+// RowEditor edits a list of small records (headers, parameters) and submits
+// them as one JSON hidden field, so the server action gets a plain list.
+export function RowEditor({ id, name, columns, initial, blank, addLabel }: {
+  id: string; name: string; columns: Column[]; initial: object[]; blank: Row; addLabel: string;
+}) {
+  const [rows, setRows] = useState<Row[]>(initial as Row[]);
+  const set = (i: number, key: string, val: string | boolean) =>
+    setRows((rs) => rs.map((r, j) => (j === i ? { ...r, [key]: val } : r)));
+  return (
+    <div id={id} className="flex flex-col gap-2" data-testid={`rows-${id}`}>
+      <input type="hidden" name={name} value={JSON.stringify(rows)} />
+      {rows.length > 0 && (
+        <div className="grid gap-2" style={{ gridTemplateColumns: `${columns.map((c) => c.width ?? "1fr").join(" ")} auto` }}>
+          {columns.map((c) => <span key={c.key} className="text-xs font-medium text-gray-500">{c.label}</span>)}
+          <span />
+          {rows.map((r, i) => (
+            <Fragment key={i}>
+              {columns.map((c) => {
+                const label = `${c.label} ${i + 1}`;
+                if (c.type === "checkbox") {
+                  return <input key={c.key} aria-label={label} type="checkbox" className="h-4 w-4 self-center"
+                    checked={Boolean(r[c.key])} onChange={(e) => set(i, c.key, e.target.checked)} />;
+                }
+                if (c.type === "select") {
+                  return <Select key={c.key} aria-label={label} value={String(r[c.key] ?? "")} onChange={(e) => set(i, c.key, e.target.value)}>
+                    {c.options?.map((o) => <option key={o} value={o}>{o}</option>)}
+                  </Select>;
+                }
+                return <Input key={c.key} aria-label={label} placeholder={c.placeholder} value={String(r[c.key] ?? "")}
+                  onChange={(e) => set(i, c.key, e.target.value)} />;
+              })}
+              <Button type="button" variant="secondary" aria-label={`Remove row ${i + 1}`} onClick={() => setRows((rs) => rs.filter((_, j) => j !== i))}>✕</Button>
+            </Fragment>
+          ))}
+        </div>
+      )}
+      <div><Button type="button" variant="secondary" onClick={() => setRows((rs) => [...rs, { ...blank }])}>{addLabel}</Button></div>
+    </div>
+  );
+}
+
+// EndpointForm documents one operation: what customers send and get back.
+export function EndpointForm({ action, endpoint, submitLabel }: { action: BoundAction; endpoint?: Endpoint; submitLabel: string }) {
+  const [state, formAction, pending] = useActionState(action, initial);
+  return <EndpointFormBody key={formKey(state)} state={state} formAction={formAction} pending={pending} endpoint={endpoint} submitLabel={submitLabel} />;
+}
+
+function EndpointFormBody({ state, formAction, pending, endpoint, submitLabel }: {
+  state: FormState; formAction: (fd: FormData) => void; pending: boolean; endpoint?: Endpoint; submitLabel: string;
+}) {
+  const uid = useId();
+  const [method, setMethod] = useState(pick(state, "method", endpoint?.method ?? "GET"));
+  const v = (k: string, fallback?: string | number) => pick(state, k, fallback === undefined ? "" : String(fallback));
+  const hasBody = method !== "GET" && method !== "DELETE";
+  return (
+    <form action={formAction} className="grid gap-4 sm:grid-cols-6">
+      <div className="sm:col-span-1">
+        <Field label="Method" htmlFor={`${uid}-method`}>
+          <Select id={`${uid}-method`} name="method" value={method} onChange={(e) => setMethod(e.target.value)}>
+            {["GET", "POST", "PUT", "PATCH", "DELETE"].map((m) => <option key={m}>{m}</option>)}
+          </Select>
+        </Field>
+      </div>
+      <div className="sm:col-span-2">
+        <Field label="Path" htmlFor={`${uid}-path`} hint={<>Relative to the API, e.g. <code className="font-mono">/branches/{"{ifsc}"}</code></>}>
+          <Input id={`${uid}-path`} name="path" required placeholder="/forecast" defaultValue={v("path", endpoint?.path)} />
+        </Field>
+      </div>
+      <div className="sm:col-span-3">
+        <Field label="Summary" htmlFor={`${uid}-summary`}>
+          <Input id={`${uid}-summary`} name="summary" placeholder="Weather forecast by coordinates" defaultValue={v("summary", endpoint?.summary)} />
+        </Field>
+      </div>
+      <div className="sm:col-span-6">
+        <Field label="Description" htmlFor={`${uid}-description`}>
+          <Textarea id={`${uid}-description`} name="description" rows={2} defaultValue={v("description", endpoint?.description)} />
+        </Field>
+      </div>
+      <div className="sm:col-span-6">
+        <Field label="Parameters" htmlFor={`${uid}-params`} hint="Path parameters must appear in the path as {name}; they are always required.">
+          <RowEditor id={`${uid}-params`} name="params_json" initial={rowsFrom(state, "params_json", endpoint?.params ?? [])}
+            columns={[
+              { key: "name", label: "Name", placeholder: "latitude" },
+              { key: "in", label: "In", type: "select", options: ["query", "path"], width: "7rem" },
+              { key: "required", label: "Required", type: "checkbox", width: "4.5rem" },
+              { key: "description", label: "Description", placeholder: "Decimal degrees", width: "2fr" },
+              { key: "example", label: "Example", placeholder: "12.97" },
+            ]}
+            blank={{ name: "", in: "query", required: false, description: "", example: "" }} addLabel="Add parameter" />
+        </Field>
+      </div>
+      <div className="sm:col-span-6">
+        <Field label="Headers the customer sends" htmlFor={`${uid}-headers`} hint="Besides X-API-Key, which every call needs.">
+          <RowEditor id={`${uid}-headers`} name="headers_json" initial={rowsFrom(state, "headers_json", endpoint?.headers ?? [])}
+            columns={[
+              { key: "name", label: "Header", placeholder: "Content-Type" },
+              { key: "required", label: "Required", type: "checkbox", width: "4.5rem" },
+              { key: "description", label: "Description", width: "2fr" },
+              { key: "example", label: "Example", placeholder: "application/json" },
+            ]}
+            blank={{ name: "", required: false, description: "", example: "" }} addLabel="Add header" />
+        </Field>
+      </div>
+      {hasBody && (
+        <div className="sm:col-span-6">
+          <Field label="Request body example" htmlFor={`${uid}-request`}>
+            <Textarea id={`${uid}-request`} name="request_example" rows={4} className="font-mono" defaultValue={v("request_example", endpoint?.request_example)} />
+          </Field>
+        </div>
+      )}
+      <div className="sm:col-span-1">
+        <Field label="Response status" htmlFor={`${uid}-status`}>
+          <Input id={`${uid}-status`} name="response_status" inputMode="numeric" defaultValue={v("response_status", endpoint?.response_status ?? 200)} />
+        </Field>
+      </div>
+      <div className="sm:col-span-2">
+        <Field label="Response content type" htmlFor={`${uid}-ctype`}>
+          <Input id={`${uid}-ctype`} name="response_content_type" defaultValue={v("response_content_type", endpoint?.response_content_type ?? "application/json")} />
+        </Field>
+      </div>
+      <div className="sm:col-span-6">
+        <Field label="Response example" htmlFor={`${uid}-response`} hint="Shown in the docs and returned by Try it (the mock).">
+          <Textarea id={`${uid}-response`} name="response_example" rows={5} className="font-mono" defaultValue={v("response_example", endpoint?.response_example)} />
+        </Field>
+      </div>
+      <div className="flex flex-col gap-2 sm:col-span-6">
+        <ErrorNote error={state.error} />
+        <OkNote ok={state.ok} />
+        <div><Button type="submit" disabled={pending}>{submitLabel}</Button></div>
       </div>
     </form>
   );

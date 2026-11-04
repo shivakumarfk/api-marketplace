@@ -47,7 +47,10 @@ func NewProvider(name, email string, agreementSigned bool, now time.Time) (Provi
 
 const (
 	AuthNone   = "none"
-	AuthAPIKey = "api_key"
+	AuthAPIKey = "api_key" // secret in a header of the provider's choosing
+	AuthBearer = "bearer"  // Authorization: Bearer <secret>
+	AuthBasic  = "basic"   // Authorization: Basic base64(<user:password>)
+	AuthQuery  = "query"   // secret in a query parameter of the provider's choosing
 	AuthOAuth  = "oauth_cc"
 
 	APIDraft     = "draft"
@@ -77,10 +80,10 @@ var forbiddenAuthHeaders = map[string]bool{
 
 func ValidateSlug(s string) error {
 	if !slugRe.MatchString(s) {
-		return Invalid("INVALID_SLUG", "slug must be 2-63 characters: lowercase letters, digits and hyphens, not starting with a hyphen")
+		return Invalid("INVALID_SLUG", "API path must be 2-63 characters: lowercase letters, digits and hyphens, not starting with a hyphen")
 	}
 	if reservedSlugs[s] {
-		return Invalid("RESERVED_SLUG", "slug "+s+" is reserved")
+		return Invalid("RESERVED_SLUG", "API path /"+s+" is reserved")
 	}
 	return nil
 }
@@ -102,34 +105,105 @@ func ValidateUpstreamURL(field, raw string) error {
 	return nil
 }
 
+// Header is a fixed name/value pair (e.g. a provider's client id).
+type Header struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+var queryParamRe = regexp.MustCompile(`^[A-Za-z0-9_.\-]{1,64}$`)
+
 // NormalizeAuth validates how the gateway authenticates to the provider and
-// returns the canonical header name. hasSecret says whether a credential is
-// (or will be) stored for the API.
-func NormalizeAuth(typ, header string, hasSecret bool) (string, error) {
-	header = strings.TrimSpace(header)
+// returns the canonical header (api_key) or query parameter (query) name; it
+// is empty for the other types. hasSecret says whether a credential is (or
+// will be) stored for the API.
+func NormalizeAuth(typ, name string, hasSecret bool) (string, error) {
+	name = strings.TrimSpace(name)
+	needSecret := func(n string) (string, error) {
+		if !hasSecret {
+			return "", Invalid("SECRET_REQUIRED", typ+" auth needs the provider's secret")
+		}
+		return n, nil
+	}
 	switch typ {
 	case AuthNone:
-		if header != "" || hasSecret {
+		if name != "" || hasSecret {
 			return "", Invalid("AUTH_UNUSED", "auth type none takes no header or secret")
 		}
 		return "", nil
 	case AuthAPIKey:
-		if !headerNameRe.MatchString(header) {
-			return "", Invalid("INVALID_AUTH_HEADER", "api_key auth needs a header name such as X-Api-Key or Authorization")
+		if !headerNameRe.MatchString(name) {
+			return "", Invalid("INVALID_AUTH_HEADER", "api_key auth needs a header name such as X-Api-Key")
 		}
-		header = textproto.CanonicalMIMEHeaderKey(header)
-		if forbiddenAuthHeaders[header] {
-			return "", Invalid("INVALID_AUTH_HEADER", "the credential cannot be sent in the "+header+" header")
+		name = textproto.CanonicalMIMEHeaderKey(name)
+		if forbiddenAuthHeaders[name] {
+			return "", Invalid("INVALID_AUTH_HEADER", "the credential cannot be sent in the "+name+" header")
 		}
-		if !hasSecret {
-			return "", Invalid("SECRET_REQUIRED", "api_key auth needs the provider's secret")
+		return needSecret(name)
+	case AuthBearer, AuthBasic:
+		if name != "" {
+			return "", Invalid("AUTH_UNUSED", typ+" auth always uses the Authorization header; leave the name empty")
 		}
-		return header, nil
+		return needSecret("")
+	case AuthQuery:
+		if !queryParamRe.MatchString(name) {
+			return "", Invalid("INVALID_AUTH_PARAM", "query auth needs a parameter name such as api_key")
+		}
+		return needSecret(name)
 	case AuthOAuth:
-		return "", Invalid("AUTH_NOT_SUPPORTED", "oauth_cc is not supported by the gateway yet; use none or api_key")
+		return "", Invalid("AUTH_NOT_SUPPORTED", "oauth_cc is not supported by the gateway yet")
 	}
-	return "", Invalid("INVALID_AUTH_TYPE", "auth type must be none or api_key")
+	return "", Invalid("INVALID_AUTH_TYPE", "auth type must be none, api_key, bearer, basic or query")
 }
+
+// ValidateBasicSecret checks the plaintext of a basic-auth credential.
+func ValidateBasicSecret(secret string) error {
+	if user, _, ok := strings.Cut(secret, ":"); !ok || user == "" {
+		return Invalid("INVALID_BASIC_SECRET", "basic auth secret must be user:password")
+	}
+	return nil
+}
+
+const maxUpstreamHeaders = 20
+
+// NormalizeUpstreamHeaders validates the fixed headers sent to the provider.
+// They must not be transport headers or collide with the credential's header.
+func NormalizeUpstreamHeaders(hs []Header, authType, authName string) ([]Header, error) {
+	if len(hs) > maxUpstreamHeaders {
+		return nil, Invalid("TOO_MANY_HEADERS", "at most 20 fixed upstream headers")
+	}
+	authHeader := ""
+	switch authType {
+	case AuthAPIKey:
+		authHeader = authName
+	case AuthBearer, AuthBasic:
+		authHeader = "Authorization"
+	}
+	out := make([]Header, 0, len(hs))
+	seen := map[string]bool{}
+	for _, h := range hs {
+		name := strings.TrimSpace(h.Name)
+		if !headerNameRe.MatchString(name) {
+			return nil, Invalid("INVALID_UPSTREAM_HEADER", "header name "+quote(name)+" is not valid")
+		}
+		name = textproto.CanonicalMIMEHeaderKey(name)
+		switch {
+		case forbiddenAuthHeaders[name]:
+			return nil, Invalid("INVALID_UPSTREAM_HEADER", "the gateway controls the "+name+" header")
+		case name == authHeader:
+			return nil, Invalid("INVALID_UPSTREAM_HEADER", name+" already carries the credential")
+		case seen[name]:
+			return nil, Invalid("INVALID_UPSTREAM_HEADER", name+" is listed twice")
+		case len(h.Value) > 1024 || strings.ContainsAny(h.Value, "\r\n\x00"):
+			return nil, Invalid("INVALID_UPSTREAM_HEADER", name+" has an invalid value")
+		}
+		seen[name] = true
+		out = append(out, Header{Name: name, Value: strings.TrimSpace(h.Value)})
+	}
+	return out, nil
+}
+
+func quote(s string) string { return "\"" + s + "\"" }
 
 // ValidateListing checks every provider-facing field of an API (not its
 // status). It normalises the text fields and the auth header in place.
@@ -163,6 +237,11 @@ func (a *API) ValidateListing() error {
 		return err
 	}
 	a.AuthHeader = h
+	hs, err := NormalizeUpstreamHeaders(a.UpstreamHeaders, a.AuthType, a.AuthHeader)
+	if err != nil {
+		return err
+	}
+	a.UpstreamHeaders = hs
 	return nil
 }
 

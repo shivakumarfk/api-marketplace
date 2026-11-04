@@ -25,5 +25,5 @@ export default function NewAPIPage() {
 
 async function Form() {
   const providers = await listProviders();
-  return <ApiForm mode="create" providers={providers} action={createAPI} />;
+  return <ApiForm mode="create" providers={providers} action={createAPI} gateway={process.env.GATEWAY_PUBLIC_URL ?? "http://localhost:8080"} />;
 }

@@ -25,6 +25,44 @@ export interface AdminPlan {
   rate_limit_rps: number;
 }
 
+export type AuthType = "none" | "api_key" | "bearer" | "basic" | "query";
+
+export interface UpstreamHeader {
+  name: string;
+  value: string;
+}
+
+export interface Param {
+  name: string;
+  in: "path" | "query";
+  required: boolean;
+  description?: string;
+  example?: string;
+}
+
+export interface DocHeader {
+  name: string;
+  required: boolean;
+  description?: string;
+  example?: string;
+}
+
+// The documented contract of one operation. Public: holds no internal fields.
+export interface Endpoint {
+  id: string;
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  path: string;
+  summary: string;
+  description: string;
+  params: Param[];
+  headers: DocHeader[];
+  request_example: string;
+  response_status: number;
+  response_content_type: string;
+  response_example: string;
+  idempotent: boolean;
+}
+
 export interface AdminAPI {
   id: string;
   provider_id: string;
@@ -35,9 +73,12 @@ export interface AdminAPI {
   status: APIStatus;
   base_url: string;
   mock_url?: string;
-  auth: { type: "none" | "api_key" | (string & {}); header?: string; has_secret: boolean };
+  // header: header name (api_key) or query parameter name (query)
+  auth: { type: AuthType | (string & {}); header?: string; has_secret: boolean };
   upstream_rate_limit_rps: number;
+  upstream_headers: UpstreamHeader[];
   plans: AdminPlan[];
+  endpoints: Endpoint[];
 }
 
 // Public catalog (GET /v1/catalog/apis). Prices here are pre-formatted with ₹.
@@ -57,6 +98,10 @@ export interface CatalogAPI {
   description: string;
   category: string;
   plans: CatalogPlan[] | null;
+}
+
+export interface CatalogDetail extends CatalogAPI {
+  endpoints: Endpoint[];
 }
 
 export interface ErrorInfo {

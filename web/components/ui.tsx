@@ -62,9 +62,9 @@ export function OkNote({ ok }: { ok?: string }) {
   return <p role="status" className="text-sm text-green-700">{ok}</p>;
 }
 
-export function Card({ title, children, actions }: { title?: string; children: ReactNode; actions?: ReactNode }) {
+export function Card({ title, children, actions, className }: { title?: string; children: ReactNode; actions?: ReactNode; className?: string }) {
   return (
-    <section className="rounded-lg border border-gray-200 bg-white p-5 shadow-sm">
+    <section className={cx("rounded-lg border border-gray-200 bg-white p-5 shadow-sm", className)}>
       {(title || actions) && (
         <div className="mb-4 flex items-center justify-between gap-4">
           {title && <h2 className="text-base font-semibold text-gray-900">{title}</h2>}

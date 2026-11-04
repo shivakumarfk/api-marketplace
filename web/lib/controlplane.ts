@@ -2,7 +2,7 @@ import "server-only";
 import { redirect } from "next/navigation";
 import { ControlPlaneError, parseError, UNREACHABLE } from "./errors";
 import { getAdminToken } from "./session";
-import type { AdminAPI, AdminPlan, CatalogAPI, Provider } from "./types";
+import type { AdminAPI, AdminPlan, CatalogAPI, CatalogDetail, Endpoint, Provider } from "./types";
 
 // Data access layer for the control plane. Server-only: the admin token and
 // the control plane's address never reach the browser.
@@ -10,7 +10,7 @@ import type { AdminAPI, AdminPlan, CatalogAPI, Provider } from "./types";
 const BASE = (process.env.CONTROL_PLANE_URL ?? "http://localhost:8081").replace(/\/$/, "");
 const TIMEOUT_MS = 10_000;
 
-type Method = "GET" | "POST" | "PATCH";
+type Method = "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
 
 // request performs one call. It throws ControlPlaneError for any failure.
 export async function request<T>(method: Method, path: string, opts: { token?: string; body?: unknown } = {}): Promise<T> {
@@ -56,6 +56,10 @@ export async function listCatalog(): Promise<CatalogAPI[]> {
   return (await request<{ apis: CatalogAPI[] }>("GET", "/v1/catalog/apis")).apis ?? [];
 }
 
+export async function getCatalogAPI(slug: string): Promise<CatalogDetail> {
+  return request<CatalogDetail>("GET", `/v1/catalog/apis/${encodeURIComponent(slug)}`);
+}
+
 // verifyToken checks an admin token without a session (used by login).
 export async function verifyToken(token: string): Promise<boolean> {
   try {
@@ -85,3 +89,9 @@ export const suspendAPI = (slug: string) => admin<AdminAPI>("POST", `/v1/admin/a
 export const createPlan = (slug: string, body: Record<string, unknown>) =>
   admin<AdminPlan>("POST", `/v1/admin/apis/${seg(slug)}/plans`, body);
 export const retirePlan = (id: string) => admin<AdminPlan>("POST", `/v1/admin/plans/${seg(id)}/retire`);
+
+export const createEndpoint = (slug: string, body: Record<string, unknown>) =>
+  admin<Endpoint>("POST", `/v1/admin/apis/${seg(slug)}/endpoints`, body);
+export const updateEndpoint = (id: string, body: Record<string, unknown>) =>
+  admin<Endpoint>("PUT", `/v1/admin/endpoints/${seg(id)}`, body);
+export const deleteEndpoint = (id: string) => admin<void>("DELETE", `/v1/admin/endpoints/${seg(id)}`);

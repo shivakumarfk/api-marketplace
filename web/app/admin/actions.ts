@@ -5,7 +5,7 @@ import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import * as cp from "@/lib/controlplane";
 import { ControlPlaneError } from "@/lib/errors";
-import { apiBody, formValues, planBody, safeNext } from "@/lib/forms";
+import { apiBody, endpointBody, formValues, planBody, safeNext } from "@/lib/forms";
 import { cookieOptions, SESSION_COOKIE } from "@/lib/session";
 import type { FormState } from "@/lib/types";
 
@@ -125,5 +125,38 @@ export async function retirePlan(planId: string, _: FormState, fd: FormData): Pr
     updateTag("catalog");
     refresh();
     return "Retired";
+  });
+}
+
+// ---------- endpoints (documentation) ----------
+
+export async function createEndpoint(slug: string, _: FormState, fd: FormData): Promise<FormState> {
+  const r = endpointBody(fd);
+  if (r.error) return { error: r.error, values: formValues(fd) };
+  return run(fd, async () => {
+    const e = await cp.createEndpoint(slug, r.body);
+    updateTag("catalog");
+    refresh();
+    return `Added ${e.method} ${e.path}`;
+  });
+}
+
+export async function updateEndpoint(id: string, _: FormState, fd: FormData): Promise<FormState> {
+  const r = endpointBody(fd);
+  if (r.error) return { error: r.error, values: formValues(fd) };
+  return run(fd, async () => {
+    await cp.updateEndpoint(id, r.body);
+    updateTag("catalog");
+    refresh();
+    return "Saved";
+  });
+}
+
+export async function deleteEndpoint(id: string, _: FormState, fd: FormData): Promise<FormState> {
+  return run(fd, async () => {
+    await cp.deleteEndpoint(id);
+    updateTag("catalog");
+    refresh();
+    return "Deleted";
   });
 }

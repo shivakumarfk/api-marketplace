@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	neturl "net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -302,10 +304,7 @@ func (g *Gateway) forward(r *http.Request, base, rest string, api catalog.API, s
 		}
 		body = b
 	}
-	url := strings.TrimRight(base, "/") + "/" + rest
-	if r.URL.RawQuery != "" {
-		url += "?" + r.URL.RawQuery
-	}
+	url := upstreamURL(base, rest, r.URL.RawQuery, api, secret)
 	hasIdem := r.Header.Get("Idempotency-Key") != ""
 
 	res := fwdResult{reqBytes: int64(len(body))}
@@ -323,9 +322,10 @@ func (g *Gateway) forward(r *http.Request, base, rest string, api catalog.API, s
 				out.Header[k] = vs
 			}
 		}
-		if secret != "" && api.AuthHeader != "" {
-			out.Header.Set(api.AuthHeader, secret)
+		for _, h := range api.UpstreamHeaders {
+			out.Header.Set(h.Name, h.Value)
 		}
+		setUpstreamAuth(out.Header, api, secret)
 		resp, err := g.d.Client.Do(out)
 		failed := err != nil
 		status := 0
@@ -391,4 +391,42 @@ func (g *Gateway) clientIP(r *http.Request) netip.Addr {
 	}
 	ip, _ := netip.ParseAddr(host)
 	return ip.Unmap()
+}
+
+// upstreamURL joins the provider base URL, the customer's path and query. For
+// query auth the credential replaces any same-named parameter the customer
+// sent, so a customer can never choose the value. The result may contain the
+// secret: it must never be logged.
+func upstreamURL(base, rest, rawQuery string, api catalog.API, secret string) string {
+	u := strings.TrimRight(base, "/") + "/" + rest
+	if api.AuthType == domain.AuthQuery && secret != "" && api.AuthHeader != "" {
+		q, err := neturl.ParseQuery(rawQuery)
+		if err != nil {
+			q = neturl.Values{} // unparsable customer query: drop it rather than forward it unsafely
+		}
+		q.Set(api.AuthHeader, secret)
+		return u + "?" + q.Encode()
+	}
+	if rawQuery != "" {
+		u += "?" + rawQuery
+	}
+	return u
+}
+
+// setUpstreamAuth adds the provider credential for header-based auth types.
+// Sandbox calls (empty secret) send none.
+func setUpstreamAuth(h http.Header, api catalog.API, secret string) {
+	if secret == "" {
+		return
+	}
+	switch api.AuthType {
+	case domain.AuthAPIKey:
+		if api.AuthHeader != "" {
+			h.Set(api.AuthHeader, secret)
+		}
+	case domain.AuthBearer:
+		h.Set("Authorization", "Bearer "+secret)
+	case domain.AuthBasic:
+		h.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(secret)))
+	}
 }

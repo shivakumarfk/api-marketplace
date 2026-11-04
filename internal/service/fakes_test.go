@@ -98,6 +98,19 @@ func (r memCatalog) ListPublished(context.Context) ([]CatalogEntry, error) {
 	}
 	return out, nil
 }
+func (r memCatalog) GetPublished(_ context.Context, slug string) (CatalogEntry, error) {
+	a, ok := r.apis[slug]
+	if !ok {
+		return CatalogEntry{}, domain.ErrNotFound
+	}
+	e := CatalogEntry{API: a}
+	for _, p := range r.plans {
+		if p.APIID == a.ID {
+			e.Plans = append(e.Plans, p)
+		}
+	}
+	return e, nil
+}
 func (r memCatalog) FindPlan(_ context.Context, slug, planID string) (domain.API, domain.Plan, error) {
 	a, ok := r.apis[slug]
 	p, ok2 := r.plans[planID]

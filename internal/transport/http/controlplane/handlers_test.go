@@ -50,6 +50,13 @@ func (f *fakeServices) TopUp(_ context.Context, _ domain.Actor, org string, rupe
 func (f *fakeServices) Balance(context.Context, string) (money.Micro, error) {
 	return money.FromRupees(99) + 950_000, f.err
 }
+func (f *fakeServices) GetPublished(_ context.Context, slug string) (service.CatalogDetail, error) {
+	return service.CatalogDetail{CatalogEntry: service.CatalogEntry{
+		API:   domain.API{Slug: slug, Name: "IFSC", BaseURL: "https://internal.example", SecretSealed: "SEALED", AuthHeader: "X-Internal"},
+		Plans: []domain.Plan{{ID: "p1", Kind: domain.PlanPAYG, PricePerCall: 20_000, ProviderCostPerCall: 15_000}}},
+		Endpoints: []domain.Endpoint{{ID: "e1", Method: "GET", Path: "/{code}", Params: []domain.Param{{Name: "code", In: "path", Required: true}},
+			ResponseStatus: 200, ResponseContentType: "application/json", ResponseExample: `{"BANK":"HDFC"}`}}}, f.err
+}
 func (f *fakeServices) ListPublished(context.Context) ([]service.CatalogEntry, error) {
 	return []service.CatalogEntry{{API: domain.API{Slug: "weather", Name: "Weather"},
 		Plans: []domain.Plan{{ID: "p1", Kind: domain.PlanPAYG, PricePerCall: 50_000}}}}, f.err
@@ -186,4 +193,33 @@ func TestCatalogShape(t *testing.T) {
 	if st, m := call(t, srv, "GET", "/nope", "", ""); st != 404 || code(m) != "NOT_FOUND" {
 		t.Fatalf("%d %v", st, m)
 	}
+}
+
+func TestCatalogDetailIsPublicAndHidesInternals(t *testing.T) {
+	srv := newServer(&fakeServices{}, fakeKeys{})
+	defer srv.Close()
+	st, m := call(t, srv, "GET", "/v1/catalog/apis/ifsc", "", "")
+	if st != 200 || m["slug"] != "ifsc" {
+		t.Fatalf("%d %v", st, m)
+	}
+	ep := m["endpoints"].([]any)[0].(map[string]any)
+	if ep["method"] != "GET" || ep["path"] != "/{code}" || ep["idempotent"] != true || ep["response_example"] != `{"BANK":"HDFC"}` {
+		t.Fatalf("%v", ep)
+	}
+	raw := fmtJSON(m)
+	for _, internal := range []string{"internal.example", "SEALED", "X-Internal", "provider_cost", "0.015"} {
+		if strings.Contains(raw, internal) {
+			t.Errorf("public detail leaks %q: %s", internal, raw)
+		}
+	}
+	srv2 := newServer(&fakeServices{err: domain.NotFound("API_NOT_FOUND", "no")}, fakeKeys{})
+	defer srv2.Close()
+	if st, m := call(t, srv2, "GET", "/v1/catalog/apis/nope", "", ""); st != 404 || code(m) != "API_NOT_FOUND" {
+		t.Fatalf("%d %v", st, m)
+	}
+}
+
+func fmtJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
 }

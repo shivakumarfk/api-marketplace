@@ -85,6 +85,19 @@ type apiResp struct {
 	Plans       []planResp `json:"plans"`
 }
 
+// catalogDetailResp is the public contract of one API. It deliberately holds
+// no internal fields: no upstream URL, provider cost or credential details.
+type catalogDetailResp struct {
+	apiResp
+	Endpoints []endpointResp `json:"endpoints"`
+}
+
+func toPlanPublic(p domain.Plan) planResp {
+	return planResp{ID: p.ID, Name: p.Name, Kind: string(p.Kind), MonthlyFee: p.MonthlyFee.String(),
+		IncludedCalls: p.IncludedCalls, PricePerCall: fmt.Sprintf("₹%.4f", float64(p.PricePerCall)/float64(money.MicroPerRupee)),
+		RateLimitRPS: p.RateLimitRPS}
+}
+
 // ---------- handlers ----------
 
 func (h handlers) listCatalog(c *gin.Context) {
@@ -97,15 +110,25 @@ func (h handlers) listCatalog(c *gin.Context) {
 	for _, e := range entries {
 		a := apiResp{Slug: e.API.Slug, Name: e.API.Name, Description: e.API.Description, Category: e.API.Category}
 		for _, p := range e.Plans {
-			a.Plans = append(a.Plans, planResp{
-				ID: p.ID, Name: p.Name, Kind: string(p.Kind), MonthlyFee: p.MonthlyFee.String(),
-				IncludedCalls: p.IncludedCalls, PricePerCall: fmt.Sprintf("₹%.4f", float64(p.PricePerCall)/float64(money.MicroPerRupee)),
-				RateLimitRPS: p.RateLimitRPS,
-			})
+			a.Plans = append(a.Plans, toPlanPublic(p))
 		}
 		out = append(out, a)
 	}
 	c.JSON(http.StatusOK, gin.H{"apis": out})
+}
+
+func (h handlers) getCatalogAPI(c *gin.Context) {
+	d, err := h.d.Catalog.GetPublished(c.Request.Context(), c.Param("api"))
+	if err != nil {
+		fail(c, h.d.Log, err)
+		return
+	}
+	out := catalogDetailResp{apiResp: apiResp{Slug: d.API.Slug, Name: d.API.Name, Description: d.API.Description,
+		Category: d.API.Category, Plans: []planResp{}}, Endpoints: toEndpointResps(d.Endpoints)}
+	for _, p := range d.Plans {
+		out.Plans = append(out.Plans, toPlanPublic(p))
+	}
+	c.JSON(http.StatusOK, out)
 }
 
 func (h handlers) createOrg(c *gin.Context) {

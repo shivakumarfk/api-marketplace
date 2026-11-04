@@ -122,7 +122,9 @@ type API struct {
 	AuthHeader   string
 	SecretSealed string // encrypted upstream credential
 	UpstreamRPS  float64
-	Status       string
+	// UpstreamHeaders are fixed, non-secret headers sent to the provider on every call.
+	UpstreamHeaders []Header
+	Status          string
 }
 
 type PlanKind string

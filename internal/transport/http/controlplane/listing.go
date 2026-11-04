@@ -25,6 +25,9 @@ type Listing interface {
 	Suspend(ctx context.Context, actor domain.Actor, slug string) (service.APIDetail, error)
 	CreatePlan(ctx context.Context, actor domain.Actor, slug string, in domain.PlanInput) (domain.Plan, error)
 	RetirePlan(ctx context.Context, actor domain.Actor, planID string) (domain.Plan, error)
+	CreateEndpoint(ctx context.Context, actor domain.Actor, slug string, e domain.Endpoint) (domain.Endpoint, error)
+	UpdateEndpoint(ctx context.Context, actor domain.Actor, id string, e domain.Endpoint) (domain.Endpoint, error)
+	DeleteEndpoint(ctx context.Context, actor domain.Actor, id string) error
 }
 
 func registerListing(admin *gin.RouterGroup, h handlers) {
@@ -39,6 +42,9 @@ func registerListing(admin *gin.RouterGroup, h handlers) {
 	admin.POST("/apis/:api/suspend", h.suspendAPI)
 	admin.POST("/apis/:api/plans", h.createPlan)
 	admin.POST("/plans/:plan/retire", h.retirePlan)
+	admin.POST("/apis/:api/endpoints", h.createEndpoint)
+	admin.PUT("/endpoints/:endpoint", h.updateEndpoint)
+	admin.DELETE("/endpoints/:endpoint", h.deleteEndpoint)
 }
 
 // ---------- DTOs ----------
@@ -58,6 +64,8 @@ type providerResp struct {
 	CreatedAt         time.Time  `json:"created_at"`
 }
 
+// authReq: header is the header name for api_key, the query parameter name
+// for query, and empty for none/bearer/basic.
 type authReq struct {
 	Type   string `json:"type" binding:"required"`
 	Header string `json:"header"`
@@ -69,25 +77,27 @@ func (a *authReq) input() service.AuthInput {
 }
 
 type createAPIReq struct {
-	ProviderID  string   `json:"provider_id" binding:"required"`
-	Slug        string   `json:"slug" binding:"required"`
-	Name        string   `json:"name" binding:"required"`
-	Description string   `json:"description"`
-	Category    string   `json:"category"`
-	BaseURL     string   `json:"base_url" binding:"required"`
-	MockURL     string   `json:"mock_url"`
-	Auth        *authReq `json:"auth"` // omitted = none
-	UpstreamRPS float64  `json:"upstream_rate_limit_rps"`
+	ProviderID      string          `json:"provider_id" binding:"required"`
+	Slug            string          `json:"slug" binding:"required"`
+	Name            string          `json:"name" binding:"required"`
+	Description     string          `json:"description"`
+	Category        string          `json:"category"`
+	BaseURL         string          `json:"base_url" binding:"required"`
+	MockURL         string          `json:"mock_url"`
+	Auth            *authReq        `json:"auth"` // omitted = none
+	UpstreamRPS     float64         `json:"upstream_rate_limit_rps"`
+	UpstreamHeaders []domain.Header `json:"upstream_headers"`
 }
 
 type updateAPIReq struct {
-	Name        *string  `json:"name"`
-	Description *string  `json:"description"`
-	Category    *string  `json:"category"`
-	BaseURL     *string  `json:"base_url"`
-	MockURL     *string  `json:"mock_url"`
-	Auth        *authReq `json:"auth"`
-	UpstreamRPS *float64 `json:"upstream_rate_limit_rps"`
+	Name            *string          `json:"name"`
+	Description     *string          `json:"description"`
+	Category        *string          `json:"category"`
+	BaseURL         *string          `json:"base_url"`
+	MockURL         *string          `json:"mock_url"`
+	Auth            *authReq         `json:"auth"`
+	UpstreamRPS     *float64         `json:"upstream_rate_limit_rps"`
+	UpstreamHeaders *[]domain.Header `json:"upstream_headers"`
 }
 
 // Money is sent and returned as exact rupee strings, e.g. "0.02".
@@ -120,18 +130,69 @@ type adminPlanResp struct {
 }
 
 type adminAPIResp struct {
-	ID          string          `json:"id"`
-	ProviderID  string          `json:"provider_id"`
-	Slug        string          `json:"slug"`
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	Category    string          `json:"category"`
-	Status      string          `json:"status"`
-	BaseURL     string          `json:"base_url"`
-	MockURL     string          `json:"mock_url,omitempty"`
-	Auth        authResp        `json:"auth"`
-	UpstreamRPS float64         `json:"upstream_rate_limit_rps"`
-	Plans       []adminPlanResp `json:"plans"`
+	ID              string          `json:"id"`
+	ProviderID      string          `json:"provider_id"`
+	Slug            string          `json:"slug"`
+	Name            string          `json:"name"`
+	Description     string          `json:"description"`
+	Category        string          `json:"category"`
+	Status          string          `json:"status"`
+	BaseURL         string          `json:"base_url"`
+	MockURL         string          `json:"mock_url,omitempty"`
+	Auth            authResp        `json:"auth"`
+	UpstreamRPS     float64         `json:"upstream_rate_limit_rps"`
+	UpstreamHeaders []domain.Header `json:"upstream_headers"`
+	Plans           []adminPlanResp `json:"plans"`
+	Endpoints       []endpointResp  `json:"endpoints"`
+}
+
+// endpointReq / endpointResp: the documented contract of one operation. The
+// same shape is used publicly (it holds no internal fields).
+type endpointReq struct {
+	Method              string             `json:"method" binding:"required"`
+	Path                string             `json:"path" binding:"required"`
+	Summary             string             `json:"summary"`
+	Description         string             `json:"description"`
+	Params              []domain.Param     `json:"params"`
+	Headers             []domain.DocHeader `json:"headers"`
+	RequestExample      string             `json:"request_example"`
+	ResponseStatus      int                `json:"response_status"`
+	ResponseContentType string             `json:"response_content_type"`
+	ResponseExample     string             `json:"response_example"`
+}
+
+func (r endpointReq) domain() domain.Endpoint {
+	return domain.Endpoint{Method: r.Method, Path: r.Path, Summary: r.Summary, Description: r.Description,
+		Params: r.Params, Headers: r.Headers, RequestExample: r.RequestExample, ResponseStatus: r.ResponseStatus,
+		ResponseContentType: r.ResponseContentType, ResponseExample: r.ResponseExample}
+}
+
+type endpointResp struct {
+	ID string `json:"id"`
+	endpointReq
+	Idempotent bool `json:"idempotent"` // the gateway retries these on provider errors
+}
+
+func toEndpointResp(e domain.Endpoint) endpointResp {
+	params, headers := e.Params, e.Headers
+	if params == nil {
+		params = []domain.Param{}
+	}
+	if headers == nil {
+		headers = []domain.DocHeader{}
+	}
+	return endpointResp{ID: e.ID, Idempotent: e.Idempotent(), endpointReq: endpointReq{Method: e.Method, Path: e.Path,
+		Summary: e.Summary, Description: e.Description, Params: params, Headers: headers,
+		RequestExample: e.RequestExample, ResponseStatus: e.ResponseStatus,
+		ResponseContentType: e.ResponseContentType, ResponseExample: e.ResponseExample}}
+}
+
+func toEndpointResps(es []domain.Endpoint) []endpointResp {
+	out := make([]endpointResp, 0, len(es))
+	for _, e := range es {
+		out = append(out, toEndpointResp(e))
+	}
+	return out
 }
 
 func toProviderResp(p domain.Provider) providerResp {
@@ -150,7 +211,11 @@ func toAPIResp(d service.APIDetail) adminAPIResp {
 	out := adminAPIResp{ID: a.ID, ProviderID: a.ProviderID, Slug: a.Slug, Name: a.Name, Description: a.Description,
 		Category: a.Category, Status: a.Status, BaseURL: a.BaseURL, MockURL: a.MockURL,
 		Auth:        authResp{Type: a.AuthType, Header: a.AuthHeader, HasSecret: a.SecretSealed != ""},
-		UpstreamRPS: a.UpstreamRPS, Plans: make([]adminPlanResp, 0, len(d.Plans))}
+		UpstreamRPS: a.UpstreamRPS, UpstreamHeaders: a.UpstreamHeaders, Plans: make([]adminPlanResp, 0, len(d.Plans)),
+		Endpoints: toEndpointResps(d.Endpoints)}
+	if out.UpstreamHeaders == nil {
+		out.UpstreamHeaders = []domain.Header{}
+	}
 	for _, p := range d.Plans {
 		out.Plans = append(out.Plans, toPlanResp(p))
 	}
@@ -203,7 +268,8 @@ func (h handlers) createAPI(c *gin.Context) {
 		return
 	}
 	in := service.CreateAPIInput{ProviderID: req.ProviderID, Slug: req.Slug, Name: req.Name, Description: req.Description,
-		Category: req.Category, BaseURL: req.BaseURL, MockURL: req.MockURL, UpstreamRPS: req.UpstreamRPS}
+		Category: req.Category, BaseURL: req.BaseURL, MockURL: req.MockURL, UpstreamRPS: req.UpstreamRPS,
+		UpstreamHeaders: req.UpstreamHeaders}
 	if req.Auth != nil {
 		in.Auth = req.Auth.input()
 	}
@@ -239,7 +305,7 @@ func (h handlers) updateAPI(c *gin.Context) {
 		return
 	}
 	in := service.UpdateAPIInput{Name: req.Name, Description: req.Description, Category: req.Category,
-		BaseURL: req.BaseURL, MockURL: req.MockURL, UpstreamRPS: req.UpstreamRPS}
+		BaseURL: req.BaseURL, MockURL: req.MockURL, UpstreamRPS: req.UpstreamRPS, UpstreamHeaders: req.UpstreamHeaders}
 	if req.Auth != nil {
 		a := req.Auth.input()
 		in.Auth = &a
@@ -303,4 +369,40 @@ func (h handlers) retirePlan(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, toPlanResp(p))
+}
+
+func (h handlers) createEndpoint(c *gin.Context) {
+	var req endpointReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		badRequest(c, err)
+		return
+	}
+	e, err := h.d.Listing.CreateEndpoint(c.Request.Context(), actor(c), c.Param("api"), req.domain())
+	if err != nil {
+		fail(c, h.d.Log, err)
+		return
+	}
+	c.JSON(http.StatusCreated, toEndpointResp(e))
+}
+
+func (h handlers) updateEndpoint(c *gin.Context) {
+	var req endpointReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		badRequest(c, err)
+		return
+	}
+	e, err := h.d.Listing.UpdateEndpoint(c.Request.Context(), actor(c), c.Param("endpoint"), req.domain())
+	if err != nil {
+		fail(c, h.d.Log, err)
+		return
+	}
+	c.JSON(http.StatusOK, toEndpointResp(e))
+}
+
+func (h handlers) deleteEndpoint(c *gin.Context) {
+	if err := h.d.Listing.DeleteEndpoint(c.Request.Context(), actor(c), c.Param("endpoint")); err != nil {
+		fail(c, h.d.Log, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
 }

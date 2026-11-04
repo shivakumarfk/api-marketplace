@@ -190,3 +190,21 @@ func TestBalanceNotFound(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+func TestCatalogGetPublished(t *testing.T) {
+	ctx := context.Background()
+	m := newMem()
+	lm := newListingMem(m)
+	m.apis["ifsc"] = domain.API{ID: "api-1", Slug: "ifsc"}
+	m.plans["p1"] = domain.Plan{ID: "p1", APIID: "api-1"}
+	lm.endpoints["e1"] = domain.Endpoint{ID: "e1", APIID: "api-1", Method: "GET", Path: "/{code}"}
+	lm.endpoints["e2"] = domain.Endpoint{ID: "e2", APIID: "other", Method: "GET", Path: "/"}
+	s := &CatalogService{Catalog: memCatalog{m}, Endpoints: memEndpoints{lm}}
+	d, err := s.GetPublished(ctx, "ifsc")
+	if err != nil || len(d.Plans) != 1 || len(d.Endpoints) != 1 || d.Endpoints[0].ID != "e1" {
+		t.Fatalf("%+v %v", d, err)
+	}
+	if _, err := s.GetPublished(ctx, "nope"); codeOf(err) != "API_NOT_FOUND" {
+		t.Fatal(err)
+	}
+}

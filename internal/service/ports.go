@@ -38,6 +38,8 @@ type CatalogEntry struct {
 
 type CatalogRepo interface {
 	ListPublished(ctx context.Context) ([]CatalogEntry, error)
+	// GetPublished returns one published API with its active plans; domain.ErrNotFound otherwise.
+	GetPublished(ctx context.Context, slug string) (CatalogEntry, error)
 	// FindPlan returns a published API and one of its active plans; domain.ErrNotFound otherwise.
 	FindPlan(ctx context.Context, apiSlug, planID string) (domain.API, domain.Plan, error)
 }
@@ -107,4 +109,12 @@ type PlanRepo interface {
 	Get(ctx context.Context, id string) (domain.Plan, error)
 	ListByAPI(ctx context.Context, apiID string) ([]domain.Plan, error) // every status
 	SetStatus(ctx context.Context, id, status string) error
+}
+
+type EndpointRepo interface {
+	Create(ctx context.Context, e domain.Endpoint) (domain.Endpoint, error) // Conflict if method+path exists
+	Get(ctx context.Context, id string) (domain.Endpoint, error)
+	ListByAPI(ctx context.Context, apiID string) ([]domain.Endpoint, error)
+	Update(ctx context.Context, e domain.Endpoint) error
+	Delete(ctx context.Context, id string) error
 }

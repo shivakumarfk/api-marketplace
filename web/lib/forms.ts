@@ -35,7 +35,9 @@ const isErr = (v: unknown): v is ErrorInfo => typeof v === "object" && v !== nul
 function auth(fd: FormData): Record<string, string> {
   const type = str(fd, "auth_type") || "none";
   if (type === "none") return { type };
-  const a: Record<string, string> = { type, header: str(fd, "auth_header") };
+  // bearer and basic always use the Authorization header: no name to send.
+  const a: Record<string, string> = { type };
+  if (type === "api_key" || type === "query") a.header = str(fd, "auth_header");
   const secret = fd.get("secret");
   if (typeof secret === "string" && secret !== "") a.secret = secret; // not trimmed: secrets are exact
   return a;
@@ -46,6 +48,8 @@ function auth(fd: FormData): Record<string, string> {
 export function apiBody(fd: FormData, mode: "create" | "update"): Result {
   const rps = num(fd, "upstream_rate_limit_rps");
   if (isErr(rps)) return { error: rps };
+  const headers = jsonRows<{ name: string; value: string }>(fd, "upstream_headers_json", (r) => r.name.trim() !== "");
+  if (isErr(headers)) return { error: headers };
   const body: Record<string, unknown> = {
     name: str(fd, "name"),
     description: str(fd, "description"),
@@ -54,6 +58,7 @@ export function apiBody(fd: FormData, mode: "create" | "update"): Result {
     mock_url: str(fd, "mock_url"),
     auth: auth(fd),
     upstream_rate_limit_rps: rps,
+    upstream_headers: headers,
   };
   if (mode === "create") {
     body.provider_id = str(fd, "provider_id");
@@ -78,4 +83,45 @@ export function planBody(fd: FormData): Result {
 // safeNext keeps post-login redirects inside the admin console.
 export function safeNext(next: string | null | undefined): string {
   return next && /^\/admin\/[A-Za-z0-9\-_/]*$/.test(next) && !next.startsWith("/admin/log") ? next : "/admin/apis";
+}
+
+// jsonRows reads a row editor's hidden JSON field and drops blank rows.
+function jsonRows<T>(fd: FormData, k: string, keep: (row: T) => boolean): T[] | ErrorInfo {
+  const raw = str(fd, k);
+  if (raw === "") return [];
+  try {
+    const rows: unknown = JSON.parse(raw);
+    if (!Array.isArray(rows)) throw new Error("not a list");
+    return (rows as T[]).filter(keep);
+  } catch {
+    return { code: "INVALID_ROWS", message: `${k} is not valid` };
+  }
+}
+
+// endpointBody builds the endpoint documentation body (POST/PUT).
+export function endpointBody(fd: FormData): Result {
+  const params = jsonRows<{ name: string }>(fd, "params_json", (r) => (r.name ?? "").trim() !== "");
+  if (isErr(params)) return { error: params };
+  const headers = jsonRows<{ name: string }>(fd, "headers_json", (r) => (r.name ?? "").trim() !== "");
+  if (isErr(headers)) return { error: headers };
+  const status = num(fd, "response_status", { integer: true });
+  if (isErr(status)) return { error: status };
+  const method = str(fd, "method").toUpperCase();
+  const reqExample = fd.get("request_example");
+  const resExample = fd.get("response_example");
+  return {
+    body: {
+      method,
+      path: str(fd, "path"),
+      summary: str(fd, "summary"),
+      description: str(fd, "description"),
+      params,
+      headers,
+      // GET and DELETE take no body; drop a stale example left from another method.
+      request_example: method === "GET" || method === "DELETE" ? "" : typeof reqExample === "string" ? reqExample : "",
+      response_status: status,
+      response_content_type: str(fd, "response_content_type"),
+      response_example: typeof resExample === "string" ? resExample : "",
+    },
+  };
 }

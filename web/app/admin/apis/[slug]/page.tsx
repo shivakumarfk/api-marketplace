@@ -1,8 +1,9 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { Suspense } from "react";
-import { createPlan as createPlanAction, publishAPI, retirePlan, suspendAPI, updateAPI } from "@/app/admin/actions";
-import { ActionButton, ApiForm, PlanForm } from "@/components/forms";
+import { createEndpoint, createPlan as createPlanAction, deleteEndpoint, publishAPI, retirePlan, suspendAPI, updateAPI, updateEndpoint } from "@/app/admin/actions";
+import Link from "next/link";
+import { ActionButton, ApiForm, EndpointForm, PlanForm } from "@/components/forms";
 import { Badge, Card, PageTitle, Skeleton, Table, Td } from "@/components/ui";
 import { getAPI, listProviders } from "@/lib/controlplane";
 import { ControlPlaneError } from "@/lib/errors";
@@ -69,8 +70,38 @@ async function APIDetail({ params }: Pick<PageProps<"/admin/apis/[slug]">, "para
         </div>
       </Card>
 
+      <Card title="Endpoints" actions={api.status === "published"
+        ? <Link href={`/apis/${api.slug}`} className="text-sm text-indigo-700 hover:underline">View public page →</Link>
+        : <span className="text-xs text-gray-500">Public page appears once published</span>}>
+        <p className="mb-4 text-sm text-gray-500">The public contract customers see: what to send and what comes back. Examples also power Try it.</p>
+        <div className="flex flex-col divide-y divide-gray-100">
+          {api.endpoints.length === 0 && <p className="pb-4 text-sm text-gray-500">No endpoints documented yet.</p>}
+          {api.endpoints.map((e) => (
+            <details key={e.id} className="py-3" data-testid={`endpoint-row-${e.method}-${e.path}`}>
+              <summary className="flex cursor-pointer items-center gap-3">
+                <span className="w-16 font-mono text-xs font-semibold">{e.method}</span>
+                <code className="font-mono text-sm">{e.path}</code>
+                <span className="truncate text-sm text-gray-600">{e.summary}</span>
+                <span className="ml-auto text-xs text-gray-400">{e.params.length} params · {e.response_status}</span>
+              </summary>
+              <div className="mt-4 flex flex-col gap-4">
+                <EndpointForm key={JSON.stringify(e)} action={updateEndpoint.bind(null, e.id)} endpoint={e} submitLabel="Save endpoint" />
+                <ActionButton action={deleteEndpoint.bind(null, e.id)} label="Delete endpoint" variant="danger"
+                  confirm={`Delete ${e.method} ${e.path} from the docs?`} testId={`delete-${e.method}-${e.path}`} />
+              </div>
+            </details>
+          ))}
+        </div>
+        <div className="mt-4 border-t border-gray-100 pt-5">
+          <h3 className="mb-3 text-sm font-semibold text-gray-900">Add endpoint</h3>
+          <div data-testid="add-endpoint">
+            <EndpointForm action={createEndpoint.bind(null, api.slug)} submitLabel="Add endpoint" />
+          </div>
+        </div>
+      </Card>
+
       <Card title="Listing and upstream">
-        <ApiForm key={JSON.stringify(api)} mode="update" providers={providers} api={api} action={updateAPI.bind(null, api.slug)} />
+        <ApiForm key={JSON.stringify(api)} mode="update" providers={providers} api={api} action={updateAPI.bind(null, api.slug)} gateway={gateway} />
       </Card>
     </div>
   );

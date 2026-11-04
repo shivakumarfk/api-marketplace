@@ -19,8 +19,10 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ../migrations/postgres/0001_init.sql:/docker-entrypoint-initdb.d/0001_init.sql:ro
+      - ../migrations/postgres/0002_api_docs_and_auth.sql:/docker-entrypoint-initdb.d/0002_api_docs_and_auth.sql:ro
       - ../deploy/seed/seed.sql:/docker-entrypoint-initdb.d/9999_seed.sql:ro
       - ../deploy/seed/real-apis.sql:/docker-entrypoint-initdb.d/9999_z_real_apis.sql:ro # must sort after 9999_seed.sql
+      - ../deploy/seed/endpoints.sql:/docker-entrypoint-initdb.d/9999_zz_endpoints.sql:ro # after real-apis.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U apimarket"]
       interval: 3s

@@ -1,4 +1,5 @@
 import { cacheLife, cacheTag } from "next/cache";
+import Link from "next/link";
 import { connection } from "next/server";
 import { Suspense } from "react";
 import { Card, PageTitle, Skeleton } from "@/components/ui";
@@ -42,28 +43,41 @@ async function CatalogList() {
     return <p role="alert" className="text-sm text-red-700">The catalog is unavailable right now ({msg}).</p>;
   }
   if (apis.length === 0) return <p className="text-sm text-gray-500">No APIs are published yet.</p>;
+  // Every card has the same height and the same three bands (title,
+  // description, request) with plans pinned to the bottom, so rows line up.
   return (
-    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-      {apis.map((a) => (
-        <article key={a.slug} data-testid={`catalog-${a.slug}`}>
-          <Card>
-            <div className="flex items-baseline justify-between gap-2">
-              <h2 className="font-semibold">{a.name}</h2>
-              <span className="text-xs uppercase tracking-wide text-gray-500">{a.category}</span>
-            </div>
-            <p className="mt-1 font-mono text-xs text-indigo-700">/{a.slug}</p>
-            {a.description && <p className="mt-2 text-sm text-gray-600">{a.description}</p>}
-            <ul className="mt-3 space-y-1 text-sm">
-              {(a.plans ?? []).map((p) => (
-                <li key={p.id} className="flex justify-between gap-2">
-                  <span className="text-gray-700">{p.name}</span>
-                  <span className="text-right text-gray-900">{planSummary(p)} <span className="text-xs text-gray-500">· {rateLimit(p.rate_limit_rps)}</span></span>
-                </li>
-              ))}
-            </ul>
-          </Card>
-        </article>
-      ))}
+    <div className="grid auto-rows-fr gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      {apis.map((a) => {
+        const plans = a.plans ?? [];
+        const shown = plans.slice(0, 2);
+        return (
+          <article key={a.slug} data-testid={`catalog-${a.slug}`} className="h-full">
+            <Card className="relative flex h-full flex-col transition hover:border-indigo-300 hover:shadow">
+              <div className="flex items-start justify-between gap-3">
+                <h2 className="truncate font-semibold" title={a.name}>
+                  <Link href={`/apis/${a.slug}`} className="hover:text-indigo-700 after:absolute after:inset-0">{a.name}</Link>
+                </h2>
+                <span className="shrink-0 rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-600">{a.category}</span>
+              </div>
+              <p className="mt-2 line-clamp-2 min-h-10 text-sm text-gray-600">{a.description || "No description yet."}</p>
+              <div className="mt-3 mb-4 rounded-md bg-gray-50 px-2.5 py-1.5">
+                <p className="text-[11px] font-medium uppercase tracking-wide text-gray-500">Request</p>
+                <p className="truncate font-mono text-xs text-gray-800" title={`${GATEWAY}/${a.slug}/…`}>{GATEWAY}/{a.slug}/…</p>
+              </div>
+              <ul className="mt-auto space-y-1 border-t border-gray-100 pt-3 text-sm">
+                {shown.map((p) => (
+                  <li key={p.id} className="flex items-baseline justify-between gap-2">
+                    <span className="truncate text-gray-700">{p.name}</span>
+                    <span className="shrink-0 text-right text-gray-900">{planSummary(p)} <span className="text-xs text-gray-500">· {rateLimit(p.rate_limit_rps)}</span></span>
+                  </li>
+                ))}
+                {plans.length > shown.length && <li className="text-xs text-gray-500">+{plans.length - shown.length} more plan(s)</li>}
+                <li className="pt-1 text-xs font-medium text-indigo-700">Endpoints, terms and Try it →</li>
+              </ul>
+            </Card>
+          </article>
+        );
+      })}
     </div>
   );
 }
