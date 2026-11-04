@@ -1,7 +1,7 @@
 # One image per service: docker build --build-arg SERVICE=gateway .
 # Builds natively for the host (arm64 on Apple silicon / Graviton, amd64 elsewhere);
 # use `docker buildx build --platform linux/amd64,linux/arm64` for multi-arch.
-FROM golang:1.24-alpine AS build
+FROM golang:1.25-alpine AS build
 ARG SERVICE
 WORKDIR /src
 COPY go.mod go.sum* ./

@@ -12,7 +12,7 @@ The platform is a proxy/gateway in front of provider APIs. It resells them at a 
 - [docs/aws-cost-estimate.md](docs/aws-cost-estimate.md): costs for the full AWS deployment
 
 ## Quick start (Mac)
-Needs Docker Desktop (give it ~8 GB RAM). Go 1.24+ is only needed to run tests outside Docker.
+Needs Docker Desktop (give it ~8 GB RAM). Go 1.25+ is only needed to run tests outside Docker.
 
 ```bash
 git clone https://github.com/shivakumarfk/api-marketplace && cd api-marketplace
@@ -73,7 +73,7 @@ All admin calls need `Authorization: Bearer dev-admin-token`.
 | GET | `/v1/admin/orgs/{org}/balance` | |
 
 ## Code structure
-Go 1.24, **Gin** for HTTP, **pgx** for PostgreSQL, **go-redis** for Redis. Interfaces sit at every boundary, and dependencies point inward:
+Go 1.25, **Gin** for HTTP, **pgx** for PostgreSQL, **go-redis** for Redis. Interfaces sit at every boundary, and dependencies point inward:
 
 ```
 cmd/                         wiring only: build adapters, inject them (no DI framework)
