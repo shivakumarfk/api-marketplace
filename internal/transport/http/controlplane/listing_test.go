@@ -16,11 +16,12 @@ import (
 
 // fakeListing records inputs and returns canned results (or err).
 type fakeListing struct {
-	err       error
-	gotAPI    service.CreateAPIInput
-	gotUpdate service.UpdateAPIInput
-	gotPlan   domain.PlanInput
-	gotSlug   string
+	err         error
+	gotAPI      service.CreateAPIInput
+	gotUpdate   service.UpdateAPIInput
+	gotPlan     domain.PlanInput
+	gotSlug     string
+	gotEndpoint domain.Endpoint
 }
 
 var signedAt = time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
@@ -68,6 +69,20 @@ func (f *fakeListing) CreatePlan(_ context.Context, _ domain.Actor, slug string,
 	f.gotSlug, f.gotPlan = slug, in
 	return domain.Plan{ID: "plan-2", Name: in.Name, Kind: in.Kind, MonthlyFee: in.MonthlyFee, PricePerCall: in.PricePerCall,
 		ProviderCostPerCall: in.ProviderCostPerCall, Status: "active"}, f.err
+}
+func (f *fakeListing) CreateEndpoint(_ context.Context, _ domain.Actor, slug string, e domain.Endpoint) (domain.Endpoint, error) {
+	f.gotSlug, f.gotEndpoint = slug, e
+	e.ID = "ep-1"
+	return e, f.err
+}
+func (f *fakeListing) UpdateEndpoint(_ context.Context, _ domain.Actor, id string, e domain.Endpoint) (domain.Endpoint, error) {
+	f.gotSlug, f.gotEndpoint = id, e
+	e.ID = id
+	return e, f.err
+}
+func (f *fakeListing) DeleteEndpoint(_ context.Context, _ domain.Actor, id string) error {
+	f.gotSlug = id
+	return f.err
 }
 func (f *fakeListing) RetirePlan(_ context.Context, _ domain.Actor, id string) (domain.Plan, error) {
 	return domain.Plan{ID: id, Kind: domain.PlanPAYG, Status: "retired"}, f.err
@@ -209,4 +224,34 @@ func TestCreatePlanMoney(t *testing.T) {
 func jsonString(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+func TestEndpointRoutes(t *testing.T) {
+	l := &fakeListing{}
+	srv := newListingServer(l)
+	defer srv.Close()
+	body := `{"method":"GET","path":"/{code}","params":[{"name":"code","in":"path","example":"HDFC0CAGSBK"}],
+		"headers":[{"name":"Accept-Language","required":false}],"response_status":200,"response_example":"{}"}`
+	st, m := call(t, srv, "POST", "/v1/admin/apis/ifsc/endpoints", "secret", body)
+	if st != 201 || m["id"] != "ep-1" || l.gotSlug != "ifsc" || l.gotEndpoint.Params[0].Example != "HDFC0CAGSBK" || l.gotEndpoint.Headers[0].Name != "Accept-Language" {
+		t.Fatalf("%d %v %+v", st, m, l.gotEndpoint)
+	}
+	if st, _ := call(t, srv, "POST", "/v1/admin/apis/ifsc/endpoints", "secret", `{"path":"/x"}`); st != 400 {
+		t.Fatalf("method required: %d", st)
+	}
+	if st, m := call(t, srv, "PUT", "/v1/admin/endpoints/ep-9", "secret", `{"method":"GET","path":"/"}`); st != 200 || m["id"] != "ep-9" {
+		t.Fatalf("%d %v", st, m)
+	}
+	if st, _ := call(t, srv, "DELETE", "/v1/admin/endpoints/ep-9", "secret", ""); st != 204 || l.gotSlug != "ep-9" {
+		t.Fatalf("%d", st)
+	}
+	if st, _ := call(t, srv, "DELETE", "/v1/admin/endpoints/ep-9", "", ""); st != 401 {
+		t.Fatal("needs admin")
+	}
+	// upstream_headers round-trip on create
+	call(t, srv, "POST", "/v1/admin/apis", "secret", `{"provider_id":"p","slug":"x1","name":"X","base_url":"https://x.example",
+		"upstream_headers":[{"name":"X-Client-Id","value":"acme"}]}`)
+	if len(l.gotAPI.UpstreamHeaders) != 1 || l.gotAPI.UpstreamHeaders[0].Value != "acme" {
+		t.Fatalf("%+v", l.gotAPI.UpstreamHeaders)
+	}
 }

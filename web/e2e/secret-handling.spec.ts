@@ -25,7 +25,7 @@ test("the provider secret never reaches the browser, and edits keep, rotate or c
 
   // Edit page: secret field empty, "stored" hint shown.
   await page.reload();
-  await expect(page.getByLabel("Provider secret")).toHaveValue("");
+  await expect(page.locator('input[name="secret"]')).toHaveValue("");
   await expect(page.getByText("A secret is stored")).toBeVisible();
 
   // Save with a blank secret (rename only) → kept: upstream still accepts.
@@ -36,7 +36,7 @@ test("the provider secret never reaches the browser, and edits keep, rotate or c
   expect((await gateway.get(`/${slug}/today`)).status()).toBe(200);
 
   // Rotate to a wrong secret → the gateway now sends it and mockprovider answers 401.
-  await page.getByLabel("Provider secret").fill("rotated-wrong-secret");
+  await page.locator('input[name="secret"]').fill("rotated-wrong-secret");
   await page.getByRole("button", { name: "Save changes" }).click();
   await expect(page.getByRole("status").last()).toHaveText("Saved");
   await expectGatewayStatus(gateway, `/${slug}/today`, 401);

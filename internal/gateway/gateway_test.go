@@ -314,3 +314,101 @@ func TestRequestBodyTooLarge(t *testing.T) {
 		t.Fatalf("got %d %s refunds=%d", resp.StatusCode, errCode(m), e.lim.refunds)
 	}
 }
+
+func TestUpstreamAuthTypesAndFixedHeaders(t *testing.T) {
+	cases := []struct {
+		label  string
+		typ    string
+		name   string
+		secret string
+		path   string
+		check  func(r *http.Request) string // returns a problem, or ""
+	}{
+		{"bearer", "bearer", "", "tok123", "/weather/today", func(r *http.Request) string {
+			if r.Header.Get("Authorization") != "Bearer tok123" {
+				return "Authorization=" + r.Header.Get("Authorization")
+			}
+			return ""
+		}},
+		{"basic", "basic", "", "user:pa:ss", "/weather/today", func(r *http.Request) string {
+			if r.Header.Get("Authorization") != "Basic dXNlcjpwYTpzcw==" {
+				return "Authorization=" + r.Header.Get("Authorization")
+			}
+			return ""
+		}},
+		{"query replaces a customer-supplied value", "query", "appid", "real-key", "/weather/today?city=Mysuru&appid=attacker", func(r *http.Request) string {
+			q := r.URL.Query()
+			if q["appid"] == nil || len(q["appid"]) != 1 || q.Get("appid") != "real-key" || q.Get("city") != "Mysuru" {
+				return "query=" + r.URL.RawQuery
+			}
+			if r.Header.Get("X-Provider-Key") != "" {
+				return "no header credential expected"
+			}
+			return ""
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.label, func(t *testing.T) {
+			var got *http.Request
+			e := setup(t, func(w http.ResponseWriter, r *http.Request) {
+				got = r.Clone(r.Context())
+				w.Write([]byte(`{}`))
+			}, func(s *catalog.Snapshot) {
+				a := s.APIsBySlug["weather"]
+				a.AuthType, a.AuthHeader, a.Secret = c.typ, c.name, c.secret
+				a.UpstreamHeaders = []domain.Header{{Name: "X-Client-Id", Value: "acme"}}
+				s.APIsBySlug["weather"] = a
+			})
+			req, _ := http.NewRequest("GET", e.srv.URL+c.path, nil)
+			req.Header.Set("X-API-Key", liveKey)
+			req.Header.Set("X-Client-Id", "customer-tries-to-override")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != 200 || got == nil {
+				t.Fatalf("status %d", resp.StatusCode)
+			}
+			if p := c.check(got); p != "" {
+				t.Fatal(p)
+			}
+			if got.Header.Get("X-Client-Id") != "acme" {
+				t.Fatalf("fixed upstream header must win over the customer's: %q", got.Header.Get("X-Client-Id"))
+			}
+			if got.Header.Get("X-Api-Key") != "" {
+				t.Fatal("customer key leaked upstream")
+			}
+		})
+	}
+}
+
+func TestSandboxSendsNoCredentialForQueryAuth(t *testing.T) {
+	a := catalog.API{API: domain.API{AuthType: "query", AuthHeader: "appid"}, Secret: "real-key"}
+	if u := upstreamURL("http://mock/", "today", "city=x", a, ""); u != "http://mock/today?city=x" {
+		t.Fatal(u)
+	}
+	if u := upstreamURL("http://p", "today", "", a, "real-key"); u != "http://p/today?appid=real-key" {
+		t.Fatal(u)
+	}
+	h := http.Header{}
+	setUpstreamAuth(h, catalog.API{API: domain.API{AuthType: "bearer"}}, "")
+	if len(h) != 0 {
+		t.Fatal("no credential without a secret")
+	}
+}
+
+func TestQueryCredentialIsNotInUsageEvents(t *testing.T) {
+	e := setup(t, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{}`)) }, func(s *catalog.Snapshot) {
+		a := s.APIsBySlug["weather"]
+		a.AuthType, a.AuthHeader, a.Secret = "query", "appid", "real-key"
+		s.APIsBySlug["weather"] = a
+	})
+	resp, _ := do(t, e, "GET", "/weather/today?city=x", liveKey, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("%d", resp.StatusCode)
+	}
+	if b, _ := json.Marshal(e.pub.last(t)); strings.Contains(string(b), "real-key") {
+		t.Fatalf("usage event carries the credential: %s", b)
+	}
+}

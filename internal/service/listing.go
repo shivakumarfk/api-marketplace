@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"apimarket/internal/domain"
 )
@@ -15,6 +16,7 @@ type ListingService struct {
 	Providers ProviderRepo
 	APIs      APIRepo
 	Plans     PlanRepo
+	Endpoints EndpointRepo
 	Audit     AuditRepo
 	Secrets   Sealer
 	Clock     Clock
@@ -44,25 +46,29 @@ type CreateAPIInput struct {
 	MockURL     string
 	Auth        AuthInput
 	UpstreamRPS float64
+	// UpstreamHeaders are fixed, non-secret headers sent to the provider.
+	UpstreamHeaders []domain.Header
 }
 
 // UpdateAPIInput changes only the fields that are set. The slug cannot change:
 // customers' integrations depend on it. With Auth set and Auth.Secret empty,
 // an api_key API keeps its stored secret (e.g. to rename the header).
 type UpdateAPIInput struct {
-	Name        *string
-	Description *string
-	Category    *string
-	BaseURL     *string
-	MockURL     *string
-	Auth        *AuthInput
-	UpstreamRPS *float64
+	Name            *string
+	Description     *string
+	Category        *string
+	BaseURL         *string
+	MockURL         *string
+	Auth            *AuthInput
+	UpstreamRPS     *float64
+	UpstreamHeaders *[]domain.Header
 }
 
-// APIDetail is an API with all its plans, for admin views.
+// APIDetail is an API with all its plans and documented endpoints, for admin views.
 type APIDetail struct {
-	API   domain.API
-	Plans []domain.Plan
+	API       domain.API
+	Plans     []domain.Plan
+	Endpoints []domain.Endpoint
 }
 
 // ---------- providers ----------
@@ -110,7 +116,7 @@ func (s *ListingService) ListProviders(ctx context.Context) ([]domain.Provider, 
 func (s *ListingService) CreateAPI(ctx context.Context, actor domain.Actor, in CreateAPIInput) (APIDetail, error) {
 	a := domain.API{ProviderID: in.ProviderID, Slug: in.Slug, Name: in.Name, Description: in.Description,
 		Category: in.Category, BaseURL: in.BaseURL, MockURL: in.MockURL, AuthType: in.Auth.Type,
-		AuthHeader: in.Auth.Header, UpstreamRPS: in.UpstreamRPS, Status: domain.APIDraft}
+		AuthHeader: in.Auth.Header, UpstreamRPS: in.UpstreamRPS, UpstreamHeaders: in.UpstreamHeaders, Status: domain.APIDraft}
 	if a.AuthType == "" {
 		a.AuthType = domain.AuthNone
 	}
@@ -138,7 +144,7 @@ func (s *ListingService) CreateAPI(ctx context.Context, actor domain.Actor, in C
 	if err != nil {
 		return APIDetail{}, err
 	}
-	return APIDetail{API: a, Plans: []domain.Plan{}}, nil
+	return APIDetail{API: a, Plans: []domain.Plan{}, Endpoints: []domain.Endpoint{}}, nil
 }
 
 func (s *ListingService) GetAPI(ctx context.Context, slug string) (APIDetail, error) {
@@ -146,8 +152,16 @@ func (s *ListingService) GetAPI(ctx context.Context, slug string) (APIDetail, er
 	if err != nil {
 		return APIDetail{}, err
 	}
+	return s.detail(ctx, a)
+}
+
+func (s *ListingService) detail(ctx context.Context, a domain.API) (APIDetail, error) {
 	plans, err := s.Plans.ListByAPI(ctx, a.ID)
-	return APIDetail{API: a, Plans: plans}, err
+	if err != nil {
+		return APIDetail{}, err
+	}
+	eps, err := s.Endpoints.ListByAPI(ctx, a.ID)
+	return APIDetail{API: a, Plans: plans, Endpoints: eps}, err
 }
 
 func (s *ListingService) ListAPIs(ctx context.Context) ([]APIDetail, error) {
@@ -157,11 +171,11 @@ func (s *ListingService) ListAPIs(ctx context.Context) ([]APIDetail, error) {
 	}
 	out := make([]APIDetail, 0, len(apis))
 	for _, a := range apis { // admin-only view; the API count is small
-		plans, err := s.Plans.ListByAPI(ctx, a.ID)
+		d, err := s.detail(ctx, a)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, APIDetail{API: a, Plans: plans})
+		out = append(out, d)
 	}
 	return out, nil
 }
@@ -189,9 +203,13 @@ func (s *ListingService) UpdateAPI(ctx context.Context, actor domain.Actor, slug
 			a.UpstreamRPS = *in.UpstreamRPS
 			changed = append(changed, "upstream_rate_limit_rps")
 		}
+		if in.UpstreamHeaders != nil {
+			a.UpstreamHeaders = *in.UpstreamHeaders
+			changed = append(changed, "upstream_headers")
+		}
 		rotated := false
 		if in.Auth != nil {
-			keep := in.Auth.Secret == "" && in.Auth.Type == domain.AuthAPIKey && a.AuthType == domain.AuthAPIKey
+			keep := in.Auth.Secret == "" && canKeepSecret(a.AuthType, in.Auth.Type) && a.SecretSealed != ""
 			a.AuthType, a.AuthHeader = in.Auth.Type, in.Auth.Header
 			if !keep {
 				a.SecretSealed = ""
@@ -216,11 +234,18 @@ func (s *ListingService) UpdateAPI(ctx context.Context, actor domain.Actor, slug
 			map[string]any{"slug": a.Slug, "fields": changed, "secret_rotated": rotated})); err != nil {
 			return err
 		}
-		plans, err := s.Plans.ListByAPI(ctx, a.ID)
-		out = APIDetail{API: a, Plans: plans}
+		out, err = s.detail(ctx, a)
 		return err
 	})
 	return out, err
+}
+
+// canKeepSecret: an empty secret on update keeps the stored one when the new
+// auth type also uses a secret of the same shape (a key can move from a
+// header to a query parameter; a basic user:password cannot become a token).
+func canKeepSecret(from, to string) bool {
+	keyLike := map[string]bool{domain.AuthAPIKey: true, domain.AuthBearer: true, domain.AuthQuery: true}
+	return (keyLike[from] && keyLike[to]) || (from == domain.AuthBasic && to == domain.AuthBasic)
 }
 
 // Publish makes the API callable and visible in the public catalog.
@@ -254,11 +279,10 @@ func (s *ListingService) setStatus(ctx context.Context, actor domain.Actor, slug
 		if err != nil {
 			return err
 		}
-		plans, err := s.Plans.ListByAPI(ctx, a.ID)
-		if err != nil {
+		if out, err = s.detail(ctx, a); err != nil {
 			return err
 		}
-		out = APIDetail{API: a, Plans: plans}
+		plans := out.Plans
 		if a.Status == status {
 			return nil
 		}
@@ -344,11 +368,17 @@ func (s *ListingService) applySecret(a *domain.API, secret string) error {
 	if secret == "" {
 		return nil
 	}
-	if a.AuthType != domain.AuthAPIKey {
-		return domain.Invalid("AUTH_UNUSED", "a secret is only used with api_key auth")
+	switch a.AuthType {
+	case domain.AuthAPIKey, domain.AuthBearer, domain.AuthQuery:
+	case domain.AuthBasic:
+		if err := domain.ValidateBasicSecret(secret); err != nil {
+			return err
+		}
+	default:
+		return domain.Invalid("AUTH_UNUSED", "a secret is only used with api_key, bearer, basic or query auth")
 	}
-	if len(secret) > 4096 {
-		return domain.Invalid("SECRET_TOO_LONG", "secret is too long")
+	if len(secret) > 4096 || strings.ContainsAny(secret, "\r\n\x00") {
+		return domain.Invalid("INVALID_SECRET", "secret is too long or contains line breaks")
 	}
 	sealed, err := s.Secrets.Seal(secret)
 	if err != nil {
@@ -382,4 +412,76 @@ func countActive(plans []domain.Plan) int {
 		}
 	}
 	return n
+}
+
+// ---------- endpoints (documentation) ----------
+
+func (s *ListingService) CreateEndpoint(ctx context.Context, actor domain.Actor, slug string, e domain.Endpoint) (domain.Endpoint, error) {
+	if err := e.Normalize(); err != nil {
+		return domain.Endpoint{}, err
+	}
+	var out domain.Endpoint
+	err := s.Tx.WithinTx(ctx, func(ctx context.Context) error {
+		a, err := s.getAPI(ctx, slug)
+		if err != nil {
+			return err
+		}
+		e.APIID = a.ID
+		out, err = s.Endpoints.Create(ctx, e)
+		if err != nil {
+			return endpointConflict(err, e)
+		}
+		return s.Audit.Record(ctx, audit(actor, "", "endpoint.created", "endpoint", out.ID,
+			map[string]any{"api": a.Slug, "method": e.Method, "path": e.Path}))
+	})
+	return out, err
+}
+
+// UpdateEndpoint replaces an endpoint's documentation.
+func (s *ListingService) UpdateEndpoint(ctx context.Context, actor domain.Actor, id string, e domain.Endpoint) (domain.Endpoint, error) {
+	if err := e.Normalize(); err != nil {
+		return domain.Endpoint{}, err
+	}
+	err := s.Tx.WithinTx(ctx, func(ctx context.Context) error {
+		old, err := s.getEndpoint(ctx, id)
+		if err != nil {
+			return err
+		}
+		e.ID, e.APIID = old.ID, old.APIID
+		if err := s.Endpoints.Update(ctx, e); err != nil {
+			return endpointConflict(err, e)
+		}
+		return s.Audit.Record(ctx, audit(actor, "", "endpoint.updated", "endpoint", id,
+			map[string]any{"method": e.Method, "path": e.Path}))
+	})
+	return e, err
+}
+
+func (s *ListingService) DeleteEndpoint(ctx context.Context, actor domain.Actor, id string) error {
+	return s.Tx.WithinTx(ctx, func(ctx context.Context) error {
+		old, err := s.getEndpoint(ctx, id)
+		if err != nil {
+			return err
+		}
+		if err := s.Endpoints.Delete(ctx, id); err != nil {
+			return err
+		}
+		return s.Audit.Record(ctx, audit(actor, "", "endpoint.deleted", "endpoint", id,
+			map[string]any{"method": old.Method, "path": old.Path}))
+	})
+}
+
+func (s *ListingService) getEndpoint(ctx context.Context, id string) (domain.Endpoint, error) {
+	e, err := s.Endpoints.Get(ctx, id)
+	if errors.Is(err, domain.ErrNotFound) {
+		return domain.Endpoint{}, domain.NotFound("ENDPOINT_NOT_FOUND", "endpoint not found")
+	}
+	return e, err
+}
+
+func endpointConflict(err error, e domain.Endpoint) error {
+	if de, ok := domain.AsError(err); ok && de.Kind == domain.KindConflict {
+		return domain.Conflict("ENDPOINT_EXISTS", e.Method+" "+e.Path+" is already documented for this API")
+	}
+	return err
 }

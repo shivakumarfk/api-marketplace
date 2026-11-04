@@ -20,7 +20,7 @@ func setupListing() listingFixture {
 	m := newMem()
 	lm := newListingMem(m)
 	return listingFixture{m: m, lm: lm, svc: &ListingService{Tx: m, Providers: memProviders{lm}, APIs: memAPIs{lm},
-		Plans: memPlans{lm}, Audit: memAudit{m}, Secrets: fakeSealer{lm},
+		Plans: memPlans{lm}, Endpoints: memEndpoints{lm}, Audit: memAudit{m}, Secrets: fakeSealer{lm},
 		Clock: fixedClock{time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)}}}
 }
 
@@ -282,5 +282,108 @@ func TestListAPIs(t *testing.T) {
 	}
 	if provs, _ := f.svc.ListProviders(ctx); len(provs) != 1 {
 		t.Fatal(provs)
+	}
+}
+
+func TestEndpointsLifecycle(t *testing.T) {
+	ctx := context.Background()
+	f := setupListing()
+	p := f.provider(t, true)
+	f.api(t, p.ID, "ifsc")
+
+	e, err := f.svc.CreateEndpoint(ctx, admin, "ifsc", domain.Endpoint{Method: "get", Path: "/{code}",
+		Params: []domain.Param{{Name: "code", In: "path", Example: "HDFC0CAGSBK"}}, ResponseExample: `{"BANK":"HDFC Bank"}`})
+	if err != nil || e.ID == "" || e.Method != "GET" || !e.Params[0].Required || e.ResponseStatus != 200 {
+		t.Fatalf("%+v %v", e, err)
+	}
+	if _, err := f.svc.CreateEndpoint(ctx, admin, "ifsc", domain.Endpoint{Method: "GET", Path: "/{code}",
+		Params: []domain.Param{{Name: "code", In: "path"}}}); codeOf(err) != "ENDPOINT_EXISTS" {
+		t.Fatalf("duplicate: %v", err)
+	}
+	if _, err := f.svc.CreateEndpoint(ctx, admin, "ifsc", domain.Endpoint{Method: "GET", Path: "/{code}"}); codeOf(err) != "INVALID_PARAM" {
+		t.Fatalf("validation runs before storage: %v", err)
+	}
+	if _, err := f.svc.CreateEndpoint(ctx, admin, "missing", domain.Endpoint{Method: "GET", Path: "/"}); codeOf(err) != "API_NOT_FOUND" {
+		t.Fatal(err)
+	}
+
+	up, err := f.svc.UpdateEndpoint(ctx, admin, e.ID, domain.Endpoint{Method: "GET", Path: "/{code}", Summary: "Branch by IFSC",
+		Params: []domain.Param{{Name: "code", In: "path"}}})
+	if err != nil || up.ID != e.ID || up.APIID != e.APIID || up.Summary != "Branch by IFSC" {
+		t.Fatalf("%+v %v", up, err)
+	}
+	d, _ := f.svc.GetAPI(ctx, "ifsc")
+	if len(d.Endpoints) != 1 || d.Endpoints[0].Summary != "Branch by IFSC" {
+		t.Fatalf("detail includes endpoints: %+v", d.Endpoints)
+	}
+
+	if err := f.svc.DeleteEndpoint(ctx, admin, e.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.svc.DeleteEndpoint(ctx, admin, e.ID); codeOf(err) != "ENDPOINT_NOT_FOUND" {
+		t.Fatal(err)
+	}
+	if _, err := f.svc.UpdateEndpoint(ctx, admin, "nope", domain.Endpoint{Method: "GET", Path: "/"}); codeOf(err) != "ENDPOINT_NOT_FOUND" {
+		t.Fatal(err)
+	}
+	var actions []string
+	for _, a := range f.m.audit[len(f.m.audit)-3:] {
+		actions = append(actions, a.Action)
+	}
+	if strings.Join(actions, " ") != "endpoint.created endpoint.updated endpoint.deleted" {
+		t.Fatal(actions)
+	}
+}
+
+func TestNewAuthTypesAndUpstreamHeaders(t *testing.T) {
+	ctx := context.Background()
+	f := setupListing()
+	p := f.provider(t, true)
+	base := CreateAPIInput{ProviderID: p.ID, Name: "X", BaseURL: "https://x.example"}
+
+	in := base
+	in.Slug, in.Auth = "bearer-api", AuthInput{Type: "bearer", Secret: "tok"}
+	in.UpstreamHeaders = []domain.Header{{Name: "x-client-id", Value: "acme"}}
+	d, err := f.svc.CreateAPI(ctx, admin, in)
+	if err != nil || d.API.AuthType != "bearer" || unseal(d.API.SecretSealed) != "tok" || d.API.UpstreamHeaders[0].Name != "X-Client-Id" {
+		t.Fatalf("%+v %v", d.API, err)
+	}
+
+	in = base
+	in.Slug, in.Auth = "basic-api", AuthInput{Type: "basic", Secret: "no-colon"}
+	if _, err := f.svc.CreateAPI(ctx, admin, in); codeOf(err) != "INVALID_BASIC_SECRET" {
+		t.Fatalf("basic format: %v", err)
+	}
+	in.Auth.Secret = "user:pw"
+	if _, err := f.svc.CreateAPI(ctx, admin, in); err != nil {
+		t.Fatal(err)
+	}
+
+	in = base
+	in.Slug, in.Auth = "query-api", AuthInput{Type: "query", Header: "appid", Secret: "k1"}
+	if _, err := f.svc.CreateAPI(ctx, admin, in); err != nil {
+		t.Fatal(err)
+	}
+	in.Slug, in.Auth.Secret = "newline", "k1\r\nX-Evil: 1"
+	if _, err := f.svc.CreateAPI(ctx, admin, in); codeOf(err) != "INVALID_SECRET" {
+		t.Fatalf("header injection via secret: %v", err)
+	}
+
+	// Moving a key from a query parameter to a header keeps it; switching to basic needs a new secret.
+	d, err = f.svc.UpdateAPI(ctx, admin, "query-api", UpdateAPIInput{Auth: &AuthInput{Type: "api_key", Header: "X-Key"}})
+	if err != nil || unseal(d.API.SecretSealed) != "k1" {
+		t.Fatalf("keep across key-like types: %+v %v", d.API, err)
+	}
+	if _, err := f.svc.UpdateAPI(ctx, admin, "query-api", UpdateAPIInput{Auth: &AuthInput{Type: "basic"}}); codeOf(err) != "SECRET_REQUIRED" {
+		t.Fatalf("to basic: %v", err)
+	}
+	hs := []domain.Header{{Name: "Host", Value: "x"}}
+	if _, err := f.svc.UpdateAPI(ctx, admin, "query-api", UpdateAPIInput{UpstreamHeaders: &hs}); codeOf(err) != "INVALID_UPSTREAM_HEADER" {
+		t.Fatal(err)
+	}
+	empty := []domain.Header{}
+	d, err = f.svc.UpdateAPI(ctx, admin, "bearer-api", UpdateAPIInput{UpstreamHeaders: &empty})
+	if err != nil || len(d.API.UpstreamHeaders) != 0 {
+		t.Fatalf("clear headers: %+v %v", d.API.UpstreamHeaders, err)
 	}
 }

@@ -17,12 +17,13 @@ type listingMem struct {
 	providers map[string]domain.Provider
 	apisByID  map[string]domain.API
 	plansByID map[string]domain.Plan
+	endpoints map[string]domain.Endpoint
 	failSeal  bool
 }
 
 func newListingMem(m *mem) *listingMem {
 	return &listingMem{mem: m, providers: map[string]domain.Provider{}, apisByID: map[string]domain.API{},
-		plansByID: map[string]domain.Plan{}}
+		plansByID: map[string]domain.Plan{}, endpoints: map[string]domain.Endpoint{}}
 }
 
 type memProviders struct{ *listingMem }
@@ -169,4 +170,53 @@ func unseal(s string) string {
 		b[i], b[j] = b[j], b[i]
 	}
 	return string(b)
+}
+
+type memEndpoints struct{ *listingMem }
+
+func (r memEndpoints) Create(_ context.Context, e domain.Endpoint) (domain.Endpoint, error) {
+	for _, x := range r.endpoints {
+		if x.APIID == e.APIID && x.Method == e.Method && x.Path == e.Path {
+			return domain.Endpoint{}, domain.Conflict("ALREADY_EXISTS", "already exists")
+		}
+	}
+	e.ID = r.id("ep")
+	r.endpoints[e.ID] = e
+	return e, nil
+}
+func (r memEndpoints) Get(_ context.Context, id string) (domain.Endpoint, error) {
+	e, ok := r.endpoints[id]
+	if !ok {
+		return domain.Endpoint{}, domain.ErrNotFound
+	}
+	return e, nil
+}
+func (r memEndpoints) ListByAPI(_ context.Context, apiID string) ([]domain.Endpoint, error) {
+	out := []domain.Endpoint{}
+	for _, e := range r.endpoints {
+		if e.APIID == apiID {
+			out = append(out, e)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path+out[i].Method < out[j].Path+out[j].Method })
+	return out, nil
+}
+func (r memEndpoints) Update(_ context.Context, e domain.Endpoint) error {
+	if _, ok := r.endpoints[e.ID]; !ok {
+		return domain.ErrNotFound
+	}
+	for _, x := range r.endpoints {
+		if x.ID != e.ID && x.APIID == e.APIID && x.Method == e.Method && x.Path == e.Path {
+			return domain.Conflict("ALREADY_EXISTS", "already exists")
+		}
+	}
+	r.endpoints[e.ID] = e
+	return nil
+}
+func (r memEndpoints) Delete(_ context.Context, id string) error {
+	if _, ok := r.endpoints[id]; !ok {
+		return domain.ErrNotFound
+	}
+	delete(r.endpoints, id)
+	return nil
 }

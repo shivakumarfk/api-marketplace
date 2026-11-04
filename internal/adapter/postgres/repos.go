@@ -76,7 +76,7 @@ type CatalogRepo struct{ DB DB }
 
 const apiCols = `a.id, a.provider_id, a.slug, a.name, a.description, a.category, a.base_url,
 	COALESCE(a.mock_url, ''), a.upstream_auth_type, COALESCE(a.upstream_auth_header, ''),
-	COALESCE(a.upstream_secret_sealed, ''), COALESCE(a.upstream_rate_limit_rps, 0)::float8, a.status`
+	COALESCE(a.upstream_secret_sealed, ''), COALESCE(a.upstream_rate_limit_rps, 0)::float8, a.status, a.upstream_headers`
 
 const planCols = `p.id, p.api_id, p.name, p.kind, p.monthly_fee_micro, p.included_calls,
 	p.price_per_call_micro, p.provider_cost_per_call_micro, p.rate_limit_rps, p.status`
@@ -85,7 +85,7 @@ type scanner interface{ Scan(dest ...any) error }
 
 func scanAPI(s scanner, a *domain.API, extra ...any) error {
 	return s.Scan(append([]any{&a.ID, &a.ProviderID, &a.Slug, &a.Name, &a.Description, &a.Category, &a.BaseURL,
-		&a.MockURL, &a.AuthType, &a.AuthHeader, &a.SecretSealed, &a.UpstreamRPS, &a.Status}, extra...)...)
+		&a.MockURL, &a.AuthType, &a.AuthHeader, &a.SecretSealed, &a.UpstreamRPS, &a.Status, &a.UpstreamHeaders}, extra...)...)
 }
 
 func planDest(p *domain.Plan) []any {
@@ -119,6 +119,35 @@ func (r CatalogRepo) ListPublished(ctx context.Context) ([]service.CatalogEntry,
 		out[i].Plans = append(out[i].Plans, p)
 	}
 	return out, rows.Err()
+}
+
+// GetPublished returns one published API (credential stripped) with its active plans.
+func (r CatalogRepo) GetPublished(ctx context.Context, slug string) (service.CatalogEntry, error) {
+	rows, err := r.DB.q(ctx).Query(ctx, `SELECT `+apiCols+`, `+planCols+`
+		FROM apis a JOIN plans p ON p.api_id = a.id AND p.status = 'active'
+		WHERE a.status = 'published' AND a.slug = $1 ORDER BY p.monthly_fee_micro, p.name`, slug)
+	if err != nil {
+		return service.CatalogEntry{}, err
+	}
+	defer rows.Close()
+	var out service.CatalogEntry
+	for rows.Next() {
+		var a domain.API
+		var p domain.Plan
+		if err := scanAPI(rows, &a, planDest(&p)...); err != nil {
+			return service.CatalogEntry{}, err
+		}
+		a.SecretSealed = "" // never leaves the adapter for public views
+		out.API = a
+		out.Plans = append(out.Plans, p)
+	}
+	if err := rows.Err(); err != nil {
+		return service.CatalogEntry{}, err
+	}
+	if out.API.ID == "" {
+		return service.CatalogEntry{}, domain.ErrNotFound
+	}
+	return out, nil
 }
 
 func (r CatalogRepo) FindPlan(ctx context.Context, apiSlug, planID string) (domain.API, domain.Plan, error) {

@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -83,7 +84,15 @@ func TestNormalizeAuth(t *testing.T) {
 		{AuthAPIKey, "Cookie", true, "", "INVALID_AUTH_HEADER"},
 		{AuthAPIKey, "X-Key", false, "", "SECRET_REQUIRED"},
 		{AuthOAuth, "", true, "", "AUTH_NOT_SUPPORTED"},
-		{"basic", "", true, "", "INVALID_AUTH_TYPE"},
+		{"digest", "", true, "", "INVALID_AUTH_TYPE"},
+		{AuthBearer, "", true, "", ""},
+		{AuthBearer, "Authorization", true, "", "AUTH_UNUSED"},
+		{AuthBearer, "", false, "", "SECRET_REQUIRED"},
+		{AuthBasic, "", true, "", ""},
+		{AuthQuery, "api_key", true, "api_key", ""},
+		{AuthQuery, "appid", false, "", "SECRET_REQUIRED"},
+		{AuthQuery, "", true, "", "INVALID_AUTH_PARAM"},
+		{AuthQuery, "a b", true, "", "INVALID_AUTH_PARAM"},
 	}
 	for _, c := range cases {
 		h, err := NormalizeAuth(c.typ, c.header, c.secret)
@@ -168,5 +177,45 @@ func TestNewPlan(t *testing.T) {
 		if err == nil && (p.APIID != "api-1" || p.Status != "active") {
 			t.Errorf("%s: %+v", c.label, p)
 		}
+	}
+}
+
+func TestValidateBasicSecret(t *testing.T) {
+	wantCode(t, "ok", ValidateBasicSecret("user:pa:ss"), "")
+	wantCode(t, "empty password ok", ValidateBasicSecret("user:"), "")
+	for _, bad := range []string{"nocolon", ":password", ""} {
+		wantCode(t, bad, ValidateBasicSecret(bad), "INVALID_BASIC_SECRET")
+	}
+}
+
+func TestNormalizeUpstreamHeaders(t *testing.T) {
+	got, err := NormalizeUpstreamHeaders([]Header{{" x-client-id ", " acme "}, {"Accept-Version", "2"}}, AuthAPIKey, "X-Api-Key")
+	if err != nil || len(got) != 2 || got[0] != (Header{"X-Client-Id", "acme"}) {
+		t.Fatalf("%+v %v", got, err)
+	}
+	if got, _ := NormalizeUpstreamHeaders(nil, AuthNone, ""); got == nil {
+		t.Fatal("must return an empty slice, not nil (stored as a JSON array)")
+	}
+	for label, c := range map[string]struct {
+		hs       []Header
+		typ, nme string
+	}{
+		"bad name":         {[]Header{{"X Key", "v"}}, AuthNone, ""},
+		"transport header": {[]Header{{"host", "evil"}}, AuthNone, ""},
+		"collides api_key": {[]Header{{"x-api-key", "v"}}, AuthAPIKey, "X-Api-Key"},
+		"collides bearer":  {[]Header{{"Authorization", "v"}}, AuthBearer, ""},
+		"duplicate":        {[]Header{{"X-A", "1"}, {"x-a", "2"}}, AuthNone, ""},
+		"header injection": {[]Header{{"X-A", "v\r\nX-Evil: 1"}}, AuthNone, ""},
+		"value too long":   {[]Header{{"X-A", strings.Repeat("v", 1025)}}, AuthNone, ""},
+		"too many":         {make([]Header, 21), AuthNone, ""},
+	} {
+		_, err := NormalizeUpstreamHeaders(c.hs, c.typ, c.nme)
+		if e, ok := AsError(err); !ok || e.Kind != KindInvalid {
+			t.Errorf("%s: got %v", label, err)
+		}
+	}
+	// Authorization is fine as a fixed header when the credential is elsewhere.
+	if _, err := NormalizeUpstreamHeaders([]Header{{"Authorization", "Token abc"}}, AuthQuery, "key"); err != nil {
+		t.Fatal(err)
 	}
 }

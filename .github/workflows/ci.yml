@@ -51,9 +51,12 @@ jobs:
         env:
           PGPASSWORD: apimarket
         run: |
-          psql -h localhost -U apimarket -d apimarket -v ON_ERROR_STOP=1 -q -f migrations/postgres/0001_init.sql
+          for f in migrations/postgres/*.sql; do psql -h localhost -U apimarket -d apimarket -v ON_ERROR_STOP=1 -q -f "$f"; done
+          # migrations after 0001 must be idempotent: make migrate re-applies them
+          for f in $(ls migrations/postgres/*.sql | tail -n +2); do psql -h localhost -U apimarket -d apimarket -v ON_ERROR_STOP=1 -q -f "$f"; done
           psql -h localhost -U apimarket -d apimarket -v ON_ERROR_STOP=1 -q -f deploy/seed/seed.sql
           psql -h localhost -U apimarket -d apimarket -v ON_ERROR_STOP=1 -q -f deploy/seed/real-apis.sql
+          psql -h localhost -U apimarket -d apimarket -v ON_ERROR_STOP=1 -q -f deploy/seed/endpoints.sql
 
       - name: Tests (race detector; adapters tested against the real Postgres and Redis services)
         env:

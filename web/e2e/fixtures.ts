@@ -56,17 +56,28 @@ export async function createProvider(page: Page, opts: { signed?: boolean } = {}
   return name;
 }
 
-export async function createAPI(page: Page, opts: { provider: string; slug?: string; secret?: string }): Promise<string> {
+type AuthOpts = { type: "none" } | { type: "api_key" | "query"; name: string; secret: string } | { type: "bearer" | "basic"; secret: string };
+
+export async function createAPI(page: Page, opts: {
+  provider: string; slug?: string; secret?: string; baseURL?: string; auth?: AuthOpts; fixedHeaders?: [string, string][];
+}): Promise<string> {
   const slug = opts.slug ?? unique();
+  const auth: AuthOpts = opts.auth ?? { type: "api_key", name: env.mockProviderHeader, secret: opts.secret ?? env.mockProviderSecret };
   await page.goto("/admin/apis/new");
   await page.getByLabel("Provider", { exact: true }).selectOption({ label: opts.provider });
   await page.getByLabel("API path").fill(slug);
   await page.getByLabel("Name", { exact: true }).fill(`E2E ${slug}`);
   await page.getByLabel("Category").fill("testing");
-  await page.getByLabel("Base URL").fill(env.mockProviderURL);
-  await page.getByLabel("Upstream auth").selectOption("api_key");
-  await page.getByLabel("Header name").fill(env.mockProviderHeader);
-  await page.getByLabel("Provider secret").fill(opts.secret ?? env.mockProviderSecret);
+  await page.getByLabel("Base URL").fill(opts.baseURL ?? env.mockProviderURL);
+  await page.getByLabel("Upstream auth").selectOption(auth.type);
+  if (auth.type === "api_key") await page.getByLabel("Header name").fill(auth.name);
+  if (auth.type === "query") await page.getByLabel("Query parameter name").fill(auth.name);
+  if (auth.type !== "none") await page.locator('input[name="secret"]').fill(auth.secret);
+  for (const [i, [name, value]] of (opts.fixedHeaders ?? []).entries()) {
+    await page.getByRole("button", { name: "Add header" }).click();
+    await page.getByLabel(`Header ${i + 1}`, { exact: true }).fill(name);
+    await page.getByLabel(`Value ${i + 1}`, { exact: true }).fill(value);
+  }
   await page.getByRole("button", { name: "Create draft" }).click();
   await expect(page).toHaveURL(new RegExp(`/admin/apis/${slug}$`));
   track(slug);
@@ -108,4 +119,46 @@ export async function subscribe(cp: APIRequestContext, slug: string) {
 // seconds) returns the expected status.
 export async function expectGatewayStatus(gateway: APIRequestContext, path: string, status: number) {
   await expect.poll(async () => (await gateway.get(path)).status(), { timeout: 20_000, intervals: [500, 1000] }).toBe(status);
+}
+
+type ParamRow = { name: string; in?: "query" | "path"; required?: boolean; description?: string; example?: string };
+type HeaderRow = { name: string; required?: boolean; example?: string };
+
+// addEndpoint fills the admin "Add endpoint" form on the API page.
+export async function addEndpoint(page: Page, e: {
+  method?: string; path: string; summary?: string; params?: ParamRow[]; headers?: HeaderRow[];
+  requestExample?: string; status?: string; response?: string;
+}) {
+  const form = page.getByTestId("add-endpoint");
+  await form.getByLabel("Method").selectOption(e.method ?? "GET");
+  await form.getByLabel("Path", { exact: true }).fill(e.path);
+  if (e.summary) await form.getByLabel("Summary").fill(e.summary);
+  const params = form.locator('[data-testid$="-params"]');
+  for (const [i, p] of (e.params ?? []).entries()) {
+    await form.getByRole("button", { name: "Add parameter" }).click();
+    await params.getByLabel(`Name ${i + 1}`, { exact: true }).fill(p.name);
+    await params.getByLabel(`In ${i + 1}`, { exact: true }).selectOption(p.in ?? "query");
+    if (p.required) await params.getByLabel(`Required ${i + 1}`, { exact: true }).check();
+    if (p.description) await params.getByLabel(`Description ${i + 1}`, { exact: true }).fill(p.description);
+    if (p.example) await params.getByLabel(`Example ${i + 1}`, { exact: true }).fill(p.example);
+  }
+  const headers = form.locator('[data-testid$="-headers"]');
+  for (const [i, h] of (e.headers ?? []).entries()) {
+    await form.getByRole("button", { name: "Add header" }).click();
+    await headers.getByLabel(`Header ${i + 1}`, { exact: true }).fill(h.name);
+    if (h.required) await headers.getByLabel(`Required ${i + 1}`, { exact: true }).check();
+    if (h.example) await headers.getByLabel(`Example ${i + 1}`, { exact: true }).fill(h.example);
+  }
+  if (e.requestExample !== undefined) await form.getByLabel("Request body example").fill(e.requestExample);
+  await form.getByLabel("Response status").fill(e.status ?? "200");
+  if (e.response !== undefined) await form.getByLabel("Response example").fill(e.response);
+  await form.getByRole("button", { name: "Add endpoint" }).click();
+}
+
+// publishWithPlan adds a pay-per-call plan and publishes (provider must be signed).
+export async function publishWithPlan(page: Page) {
+  await addPlan(page, { price: "0.02" });
+  await expect(page.getByTestId("plan-row-PAYG")).toBeVisible();
+  await page.getByTestId("publish").click();
+  await expect(page.getByTestId("status").first()).toHaveText("published");
 }

@@ -54,9 +54,9 @@ func main() {
 		Keys:    &service.KeyService{Tx: tx, Orgs: orgs, Keys: keys, Audit: audit, Gen: apikey.RandomGenerator{}, Clock: clock},
 		Subs:    &service.SubscriptionService{Tx: tx, Orgs: orgs, Catalog: cat, Subs: subs, Audit: audit, Clock: clock},
 		Wallets: billing,
-		Catalog: &service.CatalogService{Catalog: cat},
+		Catalog: &service.CatalogService{Catalog: cat, Endpoints: postgres.EndpointRepo{DB: db}},
 		Listing: &service.ListingService{Tx: tx, Providers: postgres.ProviderRepo{DB: db}, APIs: postgres.APIRepo{DB: db},
-			Plans: postgres.PlanRepo{DB: db}, Audit: audit, Secrets: box, Clock: clock},
+			Plans: postgres.PlanRepo{DB: db}, Endpoints: postgres.EndpointRepo{DB: db}, Audit: audit, Secrets: box, Clock: clock},
 		AdminToken: cfg.AdminToken,
 		Log:        log,
 	}

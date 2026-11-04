@@ -40,6 +40,7 @@ type Wallets interface {
 
 type CatalogLister interface {
 	ListPublished(ctx context.Context) ([]service.CatalogEntry, error)
+	GetPublished(ctx context.Context, slug string) (service.CatalogDetail, error)
 }
 
 type Deps struct {
@@ -62,6 +63,7 @@ func Router(d Deps) *gin.Engine {
 
 	v1 := r.Group("/v1")
 	v1.GET("/catalog/apis", h.listCatalog)
+	v1.GET("/catalog/apis/:api", h.getCatalogAPI)
 
 	admin := v1.Group("/admin", mw.BearerToken(d.AdminToken), func(c *gin.Context) {
 		// Stage 0: a single platform-admin token. Google sign-in replaces this.

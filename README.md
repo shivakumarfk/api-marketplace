@@ -20,6 +20,7 @@ make up      # builds and starts everything with seed data
 make demo    # walks through the main gateway behaviours
 make logs    # follow gateway / control plane / metering logs
 make reset   # wipe local data and start fresh
+make migrate     # apply new schema migrations to an existing stack (after git pull)
 make seed-real   # add real public APIs (Open-Meteo, IFSC, JSONPlaceholder, httpbin) to a running stack
 make demo-real   # call them through the gateway (needs internet)
 ```
@@ -66,8 +67,8 @@ All HTTP is served with Gin. Every layer talks to the next through interfaces (s
 ## Web console (`web/`)
 Next.js 16 (App Router, Tailwind). Everything talks to the control plane **from the server**: the browser only sees the web app, so there is no CORS and the admin token never reaches client JavaScript.
 
-- **Public catalog** at `/`: published APIs and their plans.
-- **Admin** at `/admin`: providers (create, sign the resale agreement), APIs (create drafts, edit, rotate the provider secret, publish, suspend) and plans (add, retire). Errors from the control plane (`AGREEMENT_REQUIRED`, `LAST_ACTIVE_PLAN`…) are shown next to the action.
+- **Public catalog** at `/`: published APIs and their plans. Each API has a public page at `/apis/{path}` with its contract: base URL, authentication, plans and billing terms, and every documented endpoint (parameters, headers, request and response examples, a ready `curl`) with **Try it**, a free mock that returns the documented example and never calls the provider.
+- **Admin** at `/admin`: providers (create, sign the resale agreement), APIs (create drafts, edit, rotate the provider secret, publish, suspend), plans (add, retire) and endpoint documentation (add, edit, delete). Upstream auth can be none, an API key in a header, a bearer token, basic auth or an API key in a query parameter, plus fixed headers sent on every upstream call. Errors from the control plane (`AGREEMENT_REQUIRED`, `LAST_ACTIVE_PLAN`…) are shown next to the action.
 - **Login (Stage 0):** the admin token, checked against the control plane and kept in an HttpOnly, SameSite=Strict cookie. Google sign-in replaces it.
 
 ```bash
@@ -105,6 +106,11 @@ All admin calls need `Authorization: Bearer dev-admin-token`.
 | POST | `/v1/admin/apis/{slug}/publish` · `/suspend` | suspending stops calls (404) but keeps subscriptions |
 | POST | `/v1/admin/apis/{slug}/plans` | `{"name","kind":"free\|tier\|payg","monthly_fee","included_calls","price_per_call","provider_cost_per_call","rate_limit_rps"}` |
 | POST | `/v1/admin/plans/{id}/retire` | stops new subscriptions; existing subscribers keep the plan |
+| POST | `/v1/admin/apis/{slug}/endpoints` | `{"method","path":"/items/{id}","summary","description","params":[{"name","in":"path\|query","required","description","example"}],"headers":[{"name","required","description","example"}],"request_example","response_status","response_content_type","response_example"}` |
+| PUT / DELETE | `/v1/admin/endpoints/{id}` | PUT replaces the documentation |
+| GET | `/v1/catalog/apis/{slug}` | public contract of one published API: plans and endpoints, nothing internal |
+
+`auth.type` is `none`, `api_key` (`header` = header name), `bearer`, `basic` (`secret` = `user:password`) or `query` (`header` = query parameter name; the gateway replaces any value the customer sends). `upstream_headers` is a list of fixed `{"name","value"}` headers sent to the provider; they override the customer's.
 
 ```bash
 A="Authorization: Bearer dev-admin-token"

@@ -2,13 +2,28 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
+	"reflect"
 	"time"
 
 	"apimarket/internal/domain"
 	"apimarket/internal/service"
 )
 
+// jsonArray encodes a slice for a JSONB column, writing [] (not null) for nil.
+func jsonArray(v any) string {
+	if rv := reflect.ValueOf(v); v == nil || (rv.Kind() == reflect.Slice && rv.IsNil()) {
+		return "[]"
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err) // only plain structs are passed
+	}
+	return string(b)
+}
+
 var (
+	_ service.EndpointRepo = EndpointRepo{}
 	_ service.ProviderRepo = ProviderRepo{}
 	_ service.APIRepo      = APIRepo{}
 	_ service.PlanRepo     = PlanRepo{}
@@ -70,11 +85,12 @@ type APIRepo struct{ DB DB }
 func (r APIRepo) Create(ctx context.Context, a domain.API) (domain.API, error) {
 	err := r.DB.q(ctx).QueryRow(ctx, `
 		INSERT INTO apis (provider_id, slug, name, description, category, base_url, mock_url,
-		                  upstream_auth_type, upstream_auth_header, upstream_secret_sealed, upstream_rate_limit_rps, status)
-		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8, NULLIF($9, ''), NULLIF($10, ''), NULLIF($11::numeric, 0), $12)
+		                  upstream_auth_type, upstream_auth_header, upstream_secret_sealed, upstream_rate_limit_rps, status,
+		                  upstream_headers)
+		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8, NULLIF($9, ''), NULLIF($10, ''), NULLIF($11::numeric, 0), $12, $13::jsonb)
 		RETURNING id`,
 		a.ProviderID, a.Slug, a.Name, a.Description, a.Category, a.BaseURL, a.MockURL,
-		a.AuthType, a.AuthHeader, a.SecretSealed, a.UpstreamRPS, a.Status).Scan(&a.ID)
+		a.AuthType, a.AuthHeader, a.SecretSealed, a.UpstreamRPS, a.Status, jsonArray(a.UpstreamHeaders)).Scan(&a.ID)
 	return a, mapErr(err)
 }
 
@@ -113,9 +129,10 @@ func (r APIRepo) Update(ctx context.Context, a domain.API) error {
 	tag, err := r.DB.q(ctx).Exec(ctx, `
 		UPDATE apis SET name = $2, description = $3, category = $4, base_url = $5, mock_url = NULLIF($6, ''),
 		       upstream_auth_type = $7, upstream_auth_header = NULLIF($8, ''), upstream_secret_sealed = NULLIF($9, ''),
-		       upstream_rate_limit_rps = NULLIF($10::numeric, 0)
+		       upstream_rate_limit_rps = NULLIF($10::numeric, 0), upstream_headers = $11::jsonb
 		WHERE id = $1`,
-		a.ID, a.Name, a.Description, a.Category, a.BaseURL, a.MockURL, a.AuthType, a.AuthHeader, a.SecretSealed, a.UpstreamRPS)
+		a.ID, a.Name, a.Description, a.Category, a.BaseURL, a.MockURL, a.AuthType, a.AuthHeader, a.SecretSealed, a.UpstreamRPS,
+		jsonArray(a.UpstreamHeaders))
 	if err != nil {
 		return mapErr(err)
 	}
@@ -176,6 +193,80 @@ func (r PlanRepo) ListByAPI(ctx context.Context, apiID string) ([]domain.Plan, e
 
 func (r PlanRepo) SetStatus(ctx context.Context, id, status string) error {
 	tag, err := r.DB.q(ctx).Exec(ctx, `UPDATE plans SET status = $2 WHERE id = $1`, id, status)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+// ---------- endpoints ----------
+
+type EndpointRepo struct{ DB DB }
+
+const endpointCols = `id, api_id, method, path_template, summary, description, params, headers, request_example,
+	response_status, response_content_type, response_example`
+
+func scanEndpoint(s scanner, e *domain.Endpoint) error {
+	return s.Scan(&e.ID, &e.APIID, &e.Method, &e.Path, &e.Summary, &e.Description, &e.Params, &e.Headers,
+		&e.RequestExample, &e.ResponseStatus, &e.ResponseContentType, &e.ResponseExample)
+}
+
+func (r EndpointRepo) Create(ctx context.Context, e domain.Endpoint) (domain.Endpoint, error) {
+	err := r.DB.q(ctx).QueryRow(ctx, `
+		INSERT INTO api_endpoints (api_id, method, path_template, idempotent, summary, description, params, headers,
+		                           request_example, response_status, response_content_type, response_example)
+		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10, $11, $12) RETURNING id`,
+		e.APIID, e.Method, e.Path, e.Idempotent(), e.Summary, e.Description, jsonArray(e.Params), jsonArray(e.Headers),
+		e.RequestExample, e.ResponseStatus, e.ResponseContentType, e.ResponseExample).Scan(&e.ID)
+	return e, mapErr(err)
+}
+
+func (r EndpointRepo) Get(ctx context.Context, id string) (domain.Endpoint, error) {
+	var e domain.Endpoint
+	err := scanEndpoint(r.DB.q(ctx).QueryRow(ctx, `SELECT `+endpointCols+` FROM api_endpoints WHERE id = $1`, id), &e)
+	return e, mapErr(err)
+}
+
+func (r EndpointRepo) ListByAPI(ctx context.Context, apiID string) ([]domain.Endpoint, error) {
+	rows, err := r.DB.q(ctx).Query(ctx, `SELECT `+endpointCols+` FROM api_endpoints WHERE api_id = $1
+		ORDER BY path_template, array_position(ARRAY['GET','POST','PUT','PATCH','DELETE'], method)`, apiID)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	out := []domain.Endpoint{}
+	for rows.Next() {
+		var e domain.Endpoint
+		if err := scanEndpoint(rows, &e); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (r EndpointRepo) Update(ctx context.Context, e domain.Endpoint) error {
+	tag, err := r.DB.q(ctx).Exec(ctx, `
+		UPDATE api_endpoints SET method = $2, path_template = $3, idempotent = $4, summary = $5, description = $6,
+		       params = $7::jsonb, headers = $8::jsonb, request_example = $9, response_status = $10,
+		       response_content_type = $11, response_example = $12
+		WHERE id = $1`,
+		e.ID, e.Method, e.Path, e.Idempotent(), e.Summary, e.Description, jsonArray(e.Params), jsonArray(e.Headers),
+		e.RequestExample, e.ResponseStatus, e.ResponseContentType, e.ResponseExample)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+func (r EndpointRepo) Delete(ctx context.Context, id string) error {
+	tag, err := r.DB.q(ctx).Exec(ctx, `DELETE FROM api_endpoints WHERE id = $1`, id)
 	if err != nil {
 		return mapErr(err)
 	}

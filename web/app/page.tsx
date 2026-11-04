@@ -1,4 +1,5 @@
 import { cacheLife, cacheTag } from "next/cache";
+import Link from "next/link";
 import { connection } from "next/server";
 import { Suspense } from "react";
 import { Card, PageTitle, Skeleton } from "@/components/ui";
@@ -51,9 +52,11 @@ async function CatalogList() {
         const shown = plans.slice(0, 2);
         return (
           <article key={a.slug} data-testid={`catalog-${a.slug}`} className="h-full">
-            <Card className="flex h-full flex-col">
+            <Card className="relative flex h-full flex-col transition hover:border-indigo-300 hover:shadow">
               <div className="flex items-start justify-between gap-3">
-                <h2 className="truncate font-semibold" title={a.name}>{a.name}</h2>
+                <h2 className="truncate font-semibold" title={a.name}>
+                  <Link href={`/apis/${a.slug}`} className="hover:text-indigo-700 after:absolute after:inset-0">{a.name}</Link>
+                </h2>
                 <span className="shrink-0 rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-600">{a.category}</span>
               </div>
               <p className="mt-2 line-clamp-2 min-h-10 text-sm text-gray-600">{a.description || "No description yet."}</p>
@@ -69,6 +72,7 @@ async function CatalogList() {
                   </li>
                 ))}
                 {plans.length > shown.length && <li className="text-xs text-gray-500">+{plans.length - shown.length} more plan(s)</li>}
+                <li className="pt-1 text-xs font-medium text-indigo-700">Endpoints, terms and Try it →</li>
               </ul>
             </Card>
           </article>

@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	"net/netip"
 	"os"
+	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -49,12 +51,19 @@ func testDB(t *testing.T) DB {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	ddl, err := os.ReadFile("../../../migrations/postgres/0001_init.sql")
-	if err != nil {
-		t.Fatal(err)
+	files, err := filepath.Glob("../../../migrations/postgres/*.sql")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("migrations: %v", err)
 	}
-	if _, err := pool.Exec(ctx, string(ddl)); err != nil {
-		t.Fatalf("migration: %v", err)
+	sort.Strings(files)
+	for _, f := range files {
+		ddl, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, string(ddl)); err != nil {
+			t.Fatalf("migration %s: %v", filepath.Base(f), err)
+		}
 	}
 	return DB{Pool: pool}
 }
@@ -353,5 +362,86 @@ func TestListingRepos(t *testing.T) {
 	}
 	if _, _, err := (CatalogRepo{db}).FindPlan(ctx, "ifsc", p1.ID); err != domain.ErrNotFound {
 		t.Fatal("retired plans accept no new subscriptions")
+	}
+}
+
+func TestEndpointRepoAndUpstreamHeaders(t *testing.T) {
+	ctx := context.Background()
+	db := testDB(t)
+	var provID string
+	db.Pool.QueryRow(ctx, `INSERT INTO providers (name) VALUES ('P') RETURNING id`).Scan(&provID)
+	a, err := APIRepo{db}.Create(ctx, domain.API{ProviderID: provID, Slug: "ifsc", Name: "IFSC", BaseURL: "https://x",
+		AuthType: "query", AuthHeader: "appid", SecretSealed: "s", Status: "published",
+		UpstreamHeaders: []domain.Header{{Name: "X-Client-Id", Value: "acme"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := APIRepo{db}.GetBySlug(ctx, "ifsc")
+	if err != nil || len(g.UpstreamHeaders) != 1 || g.UpstreamHeaders[0].Value != "acme" || g.AuthType != "query" {
+		t.Fatalf("%+v %v", g, err)
+	}
+	g.UpstreamHeaders = nil
+	if err := (APIRepo{db}).Update(ctx, g); err != nil {
+		t.Fatal(err)
+	}
+	var raw string
+	db.Pool.QueryRow(ctx, `SELECT upstream_headers::text FROM apis WHERE id = $1`, a.ID).Scan(&raw)
+	if raw != "[]" {
+		t.Fatalf("nil headers must be stored as [], got %s", raw)
+	}
+
+	eps := EndpointRepo{db}
+	e, err := eps.Create(ctx, domain.Endpoint{APIID: a.ID, Method: "GET", Path: "/{code}", Summary: "Branch",
+		Params:  []domain.Param{{Name: "code", In: "path", Required: true, Example: "HDFC0CAGSBK"}},
+		Headers: []domain.DocHeader{{Name: "Accept-Language"}}, ResponseStatus: 200, ResponseContentType: "application/json",
+		ResponseExample: `{"BANK":"HDFC Bank"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eps.Create(ctx, domain.Endpoint{APIID: a.ID, Method: "GET", Path: "/{code}", ResponseStatus: 200, ResponseContentType: "application/json"}); err == nil {
+		t.Fatal("method+path must be unique per API")
+	} else if de, ok := domain.AsError(err); !ok || de.Kind != domain.KindConflict {
+		t.Fatalf("conflict expected: %v", err)
+	}
+	eps.Create(ctx, domain.Endpoint{APIID: a.ID, Method: "POST", Path: "/{code}", ResponseStatus: 201, ResponseContentType: "application/json"})
+	eps.Create(ctx, domain.Endpoint{APIID: a.ID, Method: "GET", Path: "/", ResponseStatus: 200, ResponseContentType: "text/plain"})
+	list, err := eps.ListByAPI(ctx, a.ID)
+	if err != nil || len(list) != 3 || list[0].Path != "/" || list[1].Method != "GET" || list[2].Method != "POST" {
+		t.Fatalf("ordered by path then method: %+v %v", list, err)
+	}
+	got, err := eps.Get(ctx, e.ID)
+	if err != nil || got.Params[0].Example != "HDFC0CAGSBK" || got.Headers[0].Name != "Accept-Language" || got.ResponseExample != `{"BANK":"HDFC Bank"}` {
+		t.Fatalf("%+v %v", got, err)
+	}
+	var idem bool
+	db.Pool.QueryRow(ctx, `SELECT idempotent FROM api_endpoints WHERE id = $1`, e.ID).Scan(&idem)
+	if !idem {
+		t.Fatal("GET endpoints are stored as idempotent")
+	}
+	got.Summary, got.Params = "Updated", nil
+	if err := eps.Update(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := eps.Get(ctx, e.ID); g.Summary != "Updated" || len(g.Params) != 0 {
+		t.Fatalf("%+v", g)
+	}
+	if err := eps.Delete(ctx, e.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := eps.Delete(ctx, e.ID); err != domain.ErrNotFound {
+		t.Fatal(err)
+	}
+
+	// Public detail: published only, credential stripped.
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO plans (api_id, name, kind, price_per_call_micro) VALUES ($1, 'PAYG', 'payg', 20000)`, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	pub, err := CatalogRepo{db}.GetPublished(ctx, "ifsc")
+	if err != nil || pub.API.SecretSealed != "" || len(pub.Plans) != 1 {
+		t.Fatalf("%+v %v", pub, err)
+	}
+	APIRepo{db}.SetStatus(ctx, a.ID, "suspended")
+	if _, err := (CatalogRepo{db}).GetPublished(ctx, "ifsc"); err != domain.ErrNotFound {
+		t.Fatalf("suspended is not public: %v", err)
 	}
 }
