@@ -26,6 +26,7 @@ make demo-real   # call them through the gateway (needs internet)
 
 | What | Where |
 |---|---|
+| Web console | http://localhost:3000 (catalog); http://localhost:3000/admin (log in with `dev-admin-token`) |
 | Gateway | http://localhost:8080/{api}/{path} with header `X-API-Key` |
 | Control plane | http://localhost:8081/v1/catalog/apis |
 | ClickHouse (call logs) | http://localhost:8123/play (user `default`, password `dev`) |
@@ -59,8 +60,24 @@ All HTTP is served with Gin. Every layer talks to the next through interfaces (s
 
 ## Not built yet (next steps)
 - Posting usage to the ledger, Redis-vs-ledger reconciliation, postpaid invoices with GST, provider statements, and the payment gateway
-- Google sign-in, the customer console and catalog UI (`web/`), provider self-service onboarding and the review/approval workflow, OpenAPI ingestion, snippets
+- Google sign-in, the customer console (keys, usage, balance), org management UI, public API detail pages, provider self-service onboarding and the review/approval workflow, OpenAPI ingestion, snippets
 - Alert engine and email/in-app notifications; OpenTelemetry instrumentation feeding SigNoz
+
+## Web console (`web/`)
+Next.js 16 (App Router, Tailwind). Everything talks to the control plane **from the server**: the browser only sees the web app, so there is no CORS and the admin token never reaches client JavaScript.
+
+- **Public catalog** at `/`: published APIs and their plans.
+- **Admin** at `/admin`: providers (create, sign the resale agreement), APIs (create drafts, edit, rotate the provider secret, publish, suspend) and plans (add, retire). Errors from the control plane (`AGREEMENT_REQUIRED`, `LAST_ACTIVE_PLAN`…) are shown next to the action.
+- **Login (Stage 0):** the admin token, checked against the control plane and kept in an HttpOnly, SameSite=Strict cookie. Google sign-in replaces it.
+
+```bash
+make web-dev     # hot reload on :3000 against the local control plane (docker compose stop web first)
+make web-check   # lint, typecheck, unit tests (Vitest), production build
+make e2e         # Playwright end-to-end tests against the running stack (make up first)
+make e2e-ui      # the same in Playwright's UI mode
+```
+
+The Playwright specs (`web/e2e/`) drive the real stack with nothing mocked. Test APIs point at the in-stack `mockprovider`, which only answers when it receives the right provider credential, so a 200 through the gateway proves the secret typed into the UI was sealed, decrypted and injected. Every spec uses unique names, so it can be re-run without `make reset`.
 
 ## Admin API (Stage 0)
 All admin calls need `Authorization: Bearer dev-admin-token`.

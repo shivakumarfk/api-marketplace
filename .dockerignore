@@ -1,0 +1,5 @@
+# Go service images (root Dockerfile) don't need the web app or local artefacts.
+web/
+.git/
+bin/
+**/.DS_Store
