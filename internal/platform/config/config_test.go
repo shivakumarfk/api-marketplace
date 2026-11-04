@@ -41,3 +41,16 @@ func TestLoadMeteringRejectsBadBatch(t *testing.T) {
 		t.Fatalf("unparsable value falls back to the default: %+v %v", c, err)
 	}
 }
+
+func TestLoadControlPlaneNeedsMasterKey(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("ADMIN_TOKEN", "t")
+	t.Setenv("MASTER_KEY", "")
+	if _, err := LoadControlPlane(); err == nil || !strings.Contains(err.Error(), "MASTER_KEY") {
+		t.Fatalf("got %v", err)
+	}
+	t.Setenv("MASTER_KEY", "k")
+	if c, err := LoadControlPlane(); err != nil || c.MasterKey != "k" {
+		t.Fatalf("%+v %v", c, err)
+	}
+}

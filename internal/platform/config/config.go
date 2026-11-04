@@ -34,6 +34,7 @@ type ControlPlane struct {
 	Common
 	DatabaseURL string
 	AdminToken  string
+	MasterKey   string // seals provider credentials; must match the gateway's
 }
 
 type Metering struct {
@@ -114,7 +115,8 @@ func LoadGateway() (Gateway, error) {
 
 func LoadControlPlane() (ControlPlane, error) {
 	e := &env{}
-	c := ControlPlane{Common: e.common(":8081"), DatabaseURL: e.must("DATABASE_URL"), AdminToken: e.must("ADMIN_TOKEN")}
+	c := ControlPlane{Common: e.common(":8081"), DatabaseURL: e.must("DATABASE_URL"), AdminToken: e.must("ADMIN_TOKEN"),
+		MasterKey: e.must("MASTER_KEY")}
 	return c, e.err()
 }
 

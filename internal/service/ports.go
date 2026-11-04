@@ -76,3 +76,35 @@ func (SystemClock) Now() time.Time { return time.Now() }
 
 // KeyGenerator creates platform API keys.
 type KeyGenerator = apikey.Generator
+
+// ---------- catalog administration ----------
+
+// Sealer encrypts provider credentials before they are stored (local key or KMS).
+type Sealer interface {
+	Seal(plaintext string) (string, error)
+}
+
+type ProviderRepo interface {
+	Create(ctx context.Context, p domain.Provider) (domain.Provider, error)
+	Get(ctx context.Context, id string) (domain.Provider, error) // domain.ErrNotFound if missing
+	List(ctx context.Context) ([]domain.Provider, error)
+	// SignAgreement records the agreement time if not already set and returns the provider.
+	SignAgreement(ctx context.Context, id string, at time.Time) (domain.Provider, error)
+}
+
+// APIRepo reads and writes APIs in any status (the public catalog uses CatalogRepo).
+type APIRepo interface {
+	Create(ctx context.Context, a domain.API) (domain.API, error) // Conflict if the slug is taken
+	GetBySlug(ctx context.Context, slug string) (domain.API, error)
+	GetByID(ctx context.Context, id string) (domain.API, error)
+	List(ctx context.Context) ([]domain.API, error)
+	Update(ctx context.Context, a domain.API) error // listing fields and credential, by ID
+	SetStatus(ctx context.Context, id, status string) error
+}
+
+type PlanRepo interface {
+	Create(ctx context.Context, p domain.Plan) (domain.Plan, error)
+	Get(ctx context.Context, id string) (domain.Plan, error)
+	ListByAPI(ctx context.Context, apiID string) ([]domain.Plan, error) // every status
+	SetStatus(ctx context.Context, id, status string) error
+}

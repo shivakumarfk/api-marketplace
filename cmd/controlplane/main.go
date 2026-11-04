@@ -9,6 +9,7 @@ import (
 
 	"apimarket/internal/adapter/postgres"
 	redisx "apimarket/internal/adapter/redis"
+	"apimarket/internal/adapter/secrets"
 	"apimarket/internal/domain/apikey"
 	"apimarket/internal/platform/config"
 	"apimarket/internal/platform/run"
@@ -40,16 +41,22 @@ func main() {
 	orgs, keys, cat := postgres.OrgRepo{DB: db}, postgres.KeyRepo{DB: db}, postgres.CatalogRepo{DB: db}
 	subs, ledger, audit := postgres.SubscriptionRepo{DB: db}, postgres.LedgerRepo{DB: db}, postgres.AuditRepo{DB: db}
 	balances := redisx.NewBalanceStore(rdb)
+	box, err := secrets.NewLocalBox(cfg.MasterKey)
+	if err != nil {
+		run.Fatal(log, "master key", err)
+	}
 	clock := service.SystemClock{}
 
 	// Services
 	billing := &service.BillingService{Tx: tx, Orgs: orgs, Ledger: ledger, Audit: audit, Balances: balances, Log: log}
 	deps := controlplane.Deps{
-		Orgs:       &service.OrgService{Tx: tx, Orgs: orgs, Audit: audit, Balances: balances, Log: log},
-		Keys:       &service.KeyService{Tx: tx, Orgs: orgs, Keys: keys, Audit: audit, Gen: apikey.RandomGenerator{}, Clock: clock},
-		Subs:       &service.SubscriptionService{Tx: tx, Orgs: orgs, Catalog: cat, Subs: subs, Audit: audit, Clock: clock},
-		Wallets:    billing,
-		Catalog:    &service.CatalogService{Catalog: cat},
+		Orgs:    &service.OrgService{Tx: tx, Orgs: orgs, Audit: audit, Balances: balances, Log: log},
+		Keys:    &service.KeyService{Tx: tx, Orgs: orgs, Keys: keys, Audit: audit, Gen: apikey.RandomGenerator{}, Clock: clock},
+		Subs:    &service.SubscriptionService{Tx: tx, Orgs: orgs, Catalog: cat, Subs: subs, Audit: audit, Clock: clock},
+		Wallets: billing,
+		Catalog: &service.CatalogService{Catalog: cat},
+		Listing: &service.ListingService{Tx: tx, Providers: postgres.ProviderRepo{DB: db}, APIs: postgres.APIRepo{DB: db},
+			Plans: postgres.PlanRepo{DB: db}, Audit: audit, Secrets: box, Clock: clock},
 		AdminToken: cfg.AdminToken,
 		Log:        log,
 	}

@@ -98,6 +98,7 @@ services:
     environment:
       <<: *go-env
       ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+      MASTER_KEY: ${MASTER_KEY:-ZKQRA+uAzZ+IT4rvPLNxPCM4g5X3CAfQUuRCFGMimSs=} # must match the gateway's
     ports: ["8081:8081"]
     depends_on:
       postgres: { condition: service_healthy }

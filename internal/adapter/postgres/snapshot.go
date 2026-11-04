@@ -86,7 +86,9 @@ func (s SnapshotSource) Load(ctx context.Context) (*catalog.Snapshot, error) {
 	}
 	rows.Close()
 
-	rows, err = q.Query(ctx, `SELECT `+planCols+` FROM plans p WHERE p.status = 'active'`)
+	// Retired plans stop new subscriptions, but existing subscribers keep them.
+	rows, err = q.Query(ctx, `SELECT `+planCols+` FROM plans p WHERE p.status = 'active'
+		OR EXISTS (SELECT 1 FROM subscriptions s WHERE s.plan_id = p.id AND s.status = 'active')`)
 	if err != nil {
 		return nil, fmt.Errorf("plans: %w", err)
 	}
