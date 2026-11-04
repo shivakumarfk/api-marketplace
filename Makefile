@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f deploy/docker-compose.yml
 
-.PHONY: help up up-all down reset logs ps demo test test-unit vet fmt tidy build
+.PHONY: help up up-all down reset logs ps demo seed-real demo-real test test-unit vet fmt tidy build
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -30,6 +30,12 @@ ps: ## Show running containers
 
 demo: ## Run example calls through the gateway
 	./scripts/demo.sh
+
+seed-real: ## Add real public APIs (Open-Meteo, IFSC, JSONPlaceholder, httpbin) to a running stack
+	$(COMPOSE) exec -T postgres psql -v ON_ERROR_STOP=1 -U apimarket -d apimarket < deploy/seed/real-apis.sql
+
+demo-real: ## Call the real public APIs through the gateway (needs internet)
+	./scripts/demo-real.sh
 
 TEST_DATABASE_URL ?= postgres://apimarket:apimarket@localhost:5432/apimarket?sslmode=disable
 
