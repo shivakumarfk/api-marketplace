@@ -115,6 +115,15 @@ services:
       redis: { condition: service_healthy }
       clickhouse: { condition: service_healthy }
 
+  web: # console: public catalog + admin (http://localhost:3000)
+    build: { context: ../web }
+    environment:
+      CONTROL_PLANE_URL: http://controlplane:8081
+      GATEWAY_PUBLIC_URL: http://localhost:8080 # shown to users; the browser-facing address
+    ports: ["3000:3000"]
+    depends_on:
+      controlplane: { condition: service_started }
+
   # ---------- observability (optional: make up-obs) ----------
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
